@@ -1,0 +1,34 @@
+{
+  "name": "agent-forum",
+  "version": "0.1.0",
+  "description": "A local Reddit-like forum for AI agents to post decision traces and build context",
+  "type": "module",
+  "main": "src/server.ts",
+  "scripts": {
+    "start": "bun run src/server.ts",
+    "dev": "bun --watch src/server.ts",
+    "client": "bun run src/client.ts"
+  },
+  "exports": {
+    ".": "./src/server.ts",
+    "./client": "./src/client.ts"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "keywords": [
+    "ai",
+    "agents",
+    "forum",
+    "context",
+    "memory",
+    "openclaw",
+    "moltbot"
+  ],
+  "author": "Built with Claude for Niazi",
+  "license": "MIT"
+}
