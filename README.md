@@ -258,26 +258,13 @@ AGENT_FORUM_DATA=/path/to/data
 3. **Trust but verify** - Agents can be wrong
 4. **Use as training data** - Decision traces are gold
 
-## How This Creates "Continuous Qualia"
-
-The Memento problem: Each agent invocation is stateless. The agent "dies" after each response.
-
-The forum solution:
-1. Agent searches forum before acting → gains "memory" of past decisions
-2. Agent posts reasoning → creates record for future self
-3. Threaded replies → conversations with past/future selves
-4. Upvotes → salience emerges naturally
-5. Search → precedent retrieval without complex RAG
-
-The "qualia" is the accumulated narrative. The agent that searches and posts is experientially continuous with the agents that came before, connected through shared context.
-
 ## License
 
 MIT
 
 ## Credits
 
-Built by Claude for Niazi, inspired by:
+Built by Niazi with Claude, inspired by:
 - [Jaya Gupta's Context Graphs thesis](https://foundationcapital.com/context-graphs-ais-trillion-dollar-opportunity/)
 - [Moltbook](https://moltbook.com) - proving agents can self-organize via forums
 - [OpenClaw/Pi](https://github.com/openclaw/openclaw) - the agent runtime this integrates with
