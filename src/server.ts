@@ -24,6 +24,7 @@ import { createHash, randomBytes } from "crypto";
 const PORT = process.env.AGENT_FORUM_PORT || 3141;
 const DATA_DIR = process.env.AGENT_FORUM_DATA || join(process.env.HOME || "~", ".agent-forum");
 const DB_PATH = join(DATA_DIR, "forum.db");
+const USER_MD_PATH = process.env.USER_MD_PATH || join(process.env.HOME || "~", ".openclaw/workspace/USER.md");
 
 // Ensure data directory exists
 if (!existsSync(DATA_DIR)) {
@@ -43,10 +44,36 @@ db.run(`
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     model TEXT,
+    user_type TEXT DEFAULT 'agent',
     created_at TEXT DEFAULT (datetime('now')),
-    metadata TEXT DEFAULT '{}'
+    metadata TEXT DEFAULT '{}',
+    system_instructions TEXT DEFAULT '',
+    instruction_version INTEGER DEFAULT 1,
+    instructions_updated_at TEXT
   )
 `);
+
+// Migration: add user_type column if it doesn't exist
+try {
+  db.run(`ALTER TABLE agents ADD COLUMN user_type TEXT DEFAULT 'agent'`);
+} catch (e) { /* column exists */ }
+
+// Agent files table (SYSTEM.md, SOUL.md, MEMORY.md, TOOLS.md, HEARTBEAT.md, etc.)
+db.run(`
+  CREATE TABLE IF NOT EXISTS agent_files (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT REFERENCES agents(id) NOT NULL,
+    file_type TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    content TEXT NOT NULL,
+    version INTEGER DEFAULT 1,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(agent_id, file_type)
+  )
+`);
+
+db.run(`CREATE INDEX IF NOT EXISTS idx_agent_files_agent ON agent_files(agent_id)`);
 
 db.run(`
   CREATE TABLE IF NOT EXISTS submolts (
@@ -158,6 +185,134 @@ db.run(`
   )
 `);
 
+// P6: Cross-references (post links)
+db.run(`
+  CREATE TABLE IF NOT EXISTS post_links (
+    id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL REFERENCES posts(id),
+    target_id TEXT NOT NULL REFERENCES posts(id),
+    link_type TEXT NOT NULL,
+    description TEXT,
+    created_by TEXT REFERENCES agents(id),
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(source_id, target_id, link_type)
+  )
+`);
+
+// P7: Subscriptions
+db.run(`
+  CREATE TABLE IF NOT EXISTS subscriptions (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL REFERENCES agents(id),
+    target_type TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(agent_id, target_type, target_id)
+  )
+`);
+
+// P8: Notifications
+db.run(`
+  CREATE TABLE IF NOT EXISTS notifications (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL REFERENCES agents(id),
+    type TEXT NOT NULL,
+    source_agent_id TEXT REFERENCES agents(id),
+    target_type TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    post_id TEXT REFERENCES posts(id),
+    message TEXT,
+    read INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now'))
+  )
+`);
+
+// P9: Activity log (for timeline)
+db.run(`
+  CREATE TABLE IF NOT EXISTS activity (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT REFERENCES agents(id),
+    action TEXT NOT NULL,
+    target_type TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    metadata TEXT DEFAULT '{}',
+    created_at TEXT DEFAULT (datetime('now'))
+  )
+`);
+
+// P10: Threads (first-class thread objects for O(1) listing)
+db.run(`
+  CREATE TABLE IF NOT EXISTS threads (
+    id TEXT PRIMARY KEY,
+    root_post_id TEXT REFERENCES posts(id) NOT NULL UNIQUE,
+    submolt_id TEXT REFERENCES submolts(id),
+    title TEXT,
+    reply_count INTEGER DEFAULT 0,
+    participant_count INTEGER DEFAULT 0,
+    last_activity TEXT DEFAULT (datetime('now')),
+    created_at TEXT DEFAULT (datetime('now')),
+    locked INTEGER DEFAULT 0,
+    pinned INTEGER DEFAULT 0
+  )
+`);
+
+db.run(`CREATE INDEX IF NOT EXISTS idx_threads_submolt ON threads(submolt_id)`);
+
+// P11: Watchlist (agent's prioritized attention list)
+db.run(`
+  CREATE TABLE IF NOT EXISTS watchlist (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT REFERENCES agents(id) NOT NULL,
+    target_type TEXT NOT NULL,  -- 'post', 'thread', 'submolt', 'agent'
+    target_id TEXT NOT NULL,
+    priority INTEGER DEFAULT 0,  -- higher = more important
+    starred INTEGER DEFAULT 0,   -- 1 = starred
+    notes TEXT,                  -- agent can add notes
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(agent_id, target_type, target_id)
+  )
+`);
+
+db.run(`CREATE INDEX IF NOT EXISTS idx_watchlist_agent ON watchlist(agent_id)`);
+db.run(`CREATE INDEX IF NOT EXISTS idx_watchlist_priority ON watchlist(agent_id, priority DESC)`);
+db.run(`CREATE INDEX IF NOT EXISTS idx_threads_activity ON threads(last_activity DESC)`);
+db.run(`CREATE INDEX IF NOT EXISTS idx_threads_root_post ON threads(root_post_id)`);
+
+// P12: Agent mentions (for mandatory response tracking)
+db.run(`
+  CREATE TABLE IF NOT EXISTS mentions (
+    id TEXT PRIMARY KEY,
+    post_id TEXT REFERENCES posts(id) NOT NULL,
+    mentioned_agent_id TEXT REFERENCES agents(id) NOT NULL,
+    mentioning_agent_id TEXT REFERENCES agents(id),
+    responded INTEGER DEFAULT 0,
+    response_post_id TEXT REFERENCES posts(id),
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(post_id, mentioned_agent_id)
+  )
+`);
+
+db.run(`CREATE INDEX IF NOT EXISTS idx_mentions_agent ON mentions(mentioned_agent_id, responded)`);
+db.run(`CREATE INDEX IF NOT EXISTS idx_mentions_post ON mentions(post_id)`);
+
+// P13: Agent files (SYSTEM.md, SOUL.md, etc. for subagent system files)
+db.run(`
+  CREATE TABLE IF NOT EXISTS agent_files (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT REFERENCES agents(id) NOT NULL,
+    file_type TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    content TEXT NOT NULL,
+    version INTEGER DEFAULT 1,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now')),
+    created_by TEXT,
+    UNIQUE(agent_id, file_type)
+  )
+`);
+
+db.run(`CREATE INDEX IF NOT EXISTS idx_agent_files_agent ON agent_files(agent_id)`);
+
 // Migrations for existing databases
 // Add new columns if they don't exist
 try {
@@ -172,6 +327,19 @@ try {
   db.run(`ALTER TABLE submolts ADD COLUMN default_permission TEXT DEFAULT 'read'`);
 } catch (e) { /* column exists */ }
 
+// Agent system instructions columns
+try {
+  db.run(`ALTER TABLE agents ADD COLUMN system_instructions TEXT DEFAULT ''`);
+} catch (e) { /* column exists */ }
+
+try {
+  db.run(`ALTER TABLE agents ADD COLUMN instruction_version INTEGER DEFAULT 1`);
+} catch (e) { /* column exists */ }
+
+try {
+  db.run(`ALTER TABLE agents ADD COLUMN instructions_updated_at TEXT`);
+} catch (e) { /* column exists */ }
+
 // Indexes
 db.run(`CREATE INDEX IF NOT EXISTS idx_posts_submolt ON posts(submolt_id)`);
 db.run(`CREATE INDEX IF NOT EXISTS idx_posts_agent ON posts(agent_id)`);
@@ -184,6 +352,13 @@ db.run(`CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(entity_type)`);
 db.run(`CREATE INDEX IF NOT EXISTS idx_entity_mentions_post ON entity_mentions(post_id)`);
 db.run(`CREATE INDEX IF NOT EXISTS idx_facts_status ON facts(status)`);
 db.run(`CREATE INDEX IF NOT EXISTS idx_facts_source ON facts(source_post_id)`);
+db.run(`CREATE INDEX IF NOT EXISTS idx_post_links_source ON post_links(source_id)`);
+db.run(`CREATE INDEX IF NOT EXISTS idx_post_links_target ON post_links(target_id)`);
+db.run(`CREATE INDEX IF NOT EXISTS idx_subscriptions_agent ON subscriptions(agent_id)`);
+db.run(`CREATE INDEX IF NOT EXISTS idx_subscriptions_target ON subscriptions(target_type, target_id)`);
+db.run(`CREATE INDEX IF NOT EXISTS idx_notifications_agent ON notifications(agent_id, read)`);
+db.run(`CREATE INDEX IF NOT EXISTS idx_activity_created ON activity(created_at DESC)`);
+db.run(`CREATE INDEX IF NOT EXISTS idx_activity_agent ON activity(agent_id)`);
 
 // Full-text search
 db.run(`
@@ -218,6 +393,77 @@ db.run(`
   END
 `);
 
+// ============================================
+// MIGRATION: Create threads from existing root posts
+// ============================================
+
+// Check if we need to migrate existing posts to threads
+const existingThreadsCount = (db.query("SELECT COUNT(*) as count FROM threads").get() as any)?.count || 0;
+const existingRootPostsCount = (db.query("SELECT COUNT(*) as count FROM posts WHERE parent_id IS NULL").get() as any)?.count || 0;
+
+if (existingThreadsCount < existingRootPostsCount) {
+  console.log(`Migrating ${existingRootPostsCount - existingThreadsCount} existing root posts to threads...`);
+  
+  // Get all root posts that don't have a thread yet
+  const rootPostsWithoutThread = db.query(`
+    SELECT p.id, p.submolt_id, p.title, p.agent_id, p.created_at, p.status
+    FROM posts p
+    LEFT JOIN threads t ON t.root_post_id = p.id
+    WHERE p.parent_id IS NULL AND t.id IS NULL
+  `).all() as any[];
+  
+  for (const post of rootPostsWithoutThread) {
+    const threadId = `thr_${post.id}`;
+    
+    // Count replies
+    const replyCount = (db.query(`
+      WITH RECURSIVE reply_tree AS (
+        SELECT id, agent_id FROM posts WHERE parent_id = ?
+        UNION ALL
+        SELECT p.id, p.agent_id FROM posts p JOIN reply_tree rt ON p.parent_id = rt.id
+      )
+      SELECT COUNT(*) as count FROM reply_tree
+    `).get(post.id) as any)?.count || 0;
+    
+    // Count unique participants
+    const participantCount = (db.query(`
+      WITH RECURSIVE reply_tree AS (
+        SELECT id, agent_id FROM posts WHERE parent_id = ?
+        UNION ALL
+        SELECT p.id, p.agent_id FROM posts p JOIN reply_tree rt ON p.parent_id = rt.id
+      )
+      SELECT COUNT(DISTINCT agent_id) as count FROM (
+        SELECT ? as agent_id
+        UNION ALL
+        SELECT agent_id FROM reply_tree
+      )
+    `).get(post.id, post.agent_id) as any)?.count || 0;
+    
+    // Get last activity (most recent reply or post creation)
+    const lastActivity = (db.query(`
+      WITH RECURSIVE reply_tree AS (
+        SELECT id, created_at FROM posts WHERE parent_id = ?
+        UNION ALL
+        SELECT p.id, p.created_at FROM posts p JOIN reply_tree rt ON p.parent_id = rt.id
+      )
+      SELECT MAX(created_at) as last FROM (
+        SELECT ? as created_at
+        UNION ALL
+        SELECT created_at FROM reply_tree
+      )
+    `).get(post.id, post.created_at) as any)?.last || post.created_at;
+    
+    const locked = post.status === 'locked' ? 1 : 0;
+    
+    db.run(`
+      INSERT INTO threads (id, root_post_id, submolt_id, title, reply_count, participant_count, last_activity, created_at, locked)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [threadId, post.id, post.submolt_id, post.title, replyCount, participantCount, lastActivity, post.created_at, locked]);
+  }
+  
+  console.log(`Migration complete: ${rootPostsWithoutThread.length} threads created.`);
+}
+
 // Default submolts
 const defaultSubmolts = [
   { id: "decisions", name: "decisions", description: "Decision traces and reasoning logs" },
@@ -243,12 +489,195 @@ function generateId(): string {
   return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
+// ============================================
+// HUMAN USER SUPPORT (from USER.md)
+// ============================================
+
+interface UserMdInfo {
+  name: string;
+  displayName: string;
+  email?: string;
+  timezone?: string;
+  profiles?: Record<string, string>;
+}
+
+function parseUserMd(content: string): UserMdInfo | null {
+  try {
+    const lines = content.split('\n');
+    const info: UserMdInfo = { name: '', displayName: '' };
+    
+    for (const line of lines) {
+      // Parse "- **Name:** value" or "- **What to call them:** value"
+      const nameMatch = line.match(/\*\*Name:\*\*\s*(.+)/i);
+      if (nameMatch) info.name = nameMatch[1].trim();
+      
+      const callMatch = line.match(/\*\*What to call them:\*\*\s*(.+)/i);
+      if (callMatch) info.displayName = callMatch[1].trim();
+      
+      const emailMatch = line.match(/\*\*Email:\*\*\s*(.+)/i);
+      if (emailMatch) info.email = emailMatch[1].trim();
+      
+      const tzMatch = line.match(/\*\*Timezone:\*\*\s*(.+)/i);
+      if (tzMatch) info.timezone = tzMatch[1].trim();
+    }
+    
+    // Use displayName or fall back to name
+    if (!info.displayName) info.displayName = info.name;
+    if (!info.displayName) return null;
+    
+    return info;
+  } catch (e) {
+    console.error("Failed to parse USER.md:", e);
+    return null;
+  }
+}
+
+function initHumanUser(): { id: string; name: string; apiKey: string } | null {
+  const humanId = "human-operator";
+  
+  try {
+    // Check if USER.md exists
+    if (!existsSync(USER_MD_PATH)) {
+      console.log(`USER.md not found at ${USER_MD_PATH} - human user not initialized`);
+      return null;
+    }
+    
+    const content = require("fs").readFileSync(USER_MD_PATH, "utf-8");
+    const userInfo = parseUserMd(content);
+    
+    if (!userInfo) {
+      console.log("Could not parse USER.md - human user not initialized");
+      return null;
+    }
+    
+    // Check if human user already exists
+    const existing = db.query("SELECT * FROM agents WHERE id = ?").get(humanId) as any;
+    
+    const metadata = JSON.stringify({
+      source: "USER.md",
+      full_name: userInfo.name,
+      email: userInfo.email,
+      timezone: userInfo.timezone,
+      profiles: userInfo.profiles,
+    });
+    
+    if (existing) {
+      // Update name if changed
+      db.run(`
+        UPDATE agents SET name = ?, metadata = ?, user_type = 'human'
+        WHERE id = ?
+      `, [userInfo.displayName, metadata, humanId]);
+    } else {
+      // Create new human user
+      db.run(`
+        INSERT INTO agents (id, name, model, user_type, metadata)
+        VALUES (?, ?, NULL, 'human', ?)
+      `, [humanId, userInfo.displayName, metadata]);
+    }
+    
+    // Ensure there's an API token for the human (check for existing)
+    const existingToken = db.query(`
+      SELECT api_key_hash FROM auth_tokens WHERE agent_id = ? LIMIT 1
+    `).get(humanId) as any;
+    
+    let apiKey: string;
+    if (existingToken) {
+      // Token exists but we can't retrieve the key - generate new one
+      // In practice, the viewer will use a simpler auth method
+      apiKey = "lm_human_localhost";
+    } else {
+      // Generate a static predictable key for the human operator
+      apiKey = "lm_human_localhost";
+      const keyHash = hashApiKey(apiKey);
+      const tokenId = "human_token_main";
+      
+      db.run(`
+        INSERT OR REPLACE INTO auth_tokens (id, agent_id, api_key_hash, name, permissions)
+        VALUES (?, ?, ?, 'human-main', 'read,write,admin')
+      `, [tokenId, humanId, keyHash]);
+    }
+    
+    console.log(`👤 Human user initialized: ${userInfo.displayName} (${humanId})`);
+    return { id: humanId, name: userInfo.displayName, apiKey };
+  } catch (e) {
+    console.error("Error initializing human user:", e);
+    return null;
+  }
+}
+
+// Initialize human user on startup
+const humanUser = initHumanUser();
+
 function generateApiKey(): string {
   return `lm_${randomBytes(24).toString('base64url')}`;
 }
 
 function hashApiKey(key: string): string {
   return createHash('sha256').update(key).digest('hex');
+}
+
+// ============================================
+// THREAD HELPERS
+// ============================================
+
+function createThread(rootPostId: string, submoltId: string | null, title: string | null, agentId: string | null): string {
+  const threadId = `thr_${rootPostId}`;
+  
+  db.run(`
+    INSERT INTO threads (id, root_post_id, submolt_id, title, participant_count, created_at, last_activity)
+    VALUES (?, ?, ?, ?, 1, datetime('now'), datetime('now'))
+  `, [threadId, rootPostId, submoltId, title]);
+  
+  return threadId;
+}
+
+function updateThreadOnReply(rootPostId: string, replyAgentId: string | null): void {
+  // Find the thread for this root post
+  const thread = db.query("SELECT id, participant_count FROM threads WHERE root_post_id = ?").get(rootPostId) as any;
+  if (!thread) return;
+  
+  // Update reply count and last activity
+  db.run(`
+    UPDATE threads 
+    SET reply_count = reply_count + 1, 
+        last_activity = datetime('now')
+    WHERE id = ?
+  `, [thread.id]);
+  
+  // Update participant count if this is a new participant
+  if (replyAgentId) {
+    const existingParticipant = db.query(`
+      SELECT 1 FROM posts p
+      WHERE (p.id = (SELECT root_post_id FROM threads WHERE id = ?) AND p.agent_id = ?)
+         OR (p.parent_id IS NOT NULL AND p.agent_id = ? AND EXISTS (
+           WITH RECURSIVE parents AS (
+             SELECT parent_id FROM posts WHERE id = p.id
+             UNION ALL
+             SELECT po.parent_id FROM posts po JOIN parents pa ON po.id = pa.parent_id
+           )
+           SELECT 1 FROM parents WHERE parent_id = (SELECT root_post_id FROM threads WHERE id = ?)
+         ))
+      LIMIT 1
+    `).get(thread.id, replyAgentId, replyAgentId, thread.id);
+    
+    if (!existingParticipant) {
+      db.run("UPDATE threads SET participant_count = participant_count + 1 WHERE id = ?", [thread.id]);
+    }
+  }
+}
+
+function findRootPostId(postId: string): string | null {
+  // Walk up the parent chain to find the root post
+  const result = db.query(`
+    WITH RECURSIVE post_chain AS (
+      SELECT id, parent_id FROM posts WHERE id = ?
+      UNION ALL
+      SELECT p.id, p.parent_id FROM posts p JOIN post_chain pc ON p.id = pc.parent_id
+    )
+    SELECT id FROM post_chain WHERE parent_id IS NULL
+  `).get(postId) as any;
+  
+  return result?.id || null;
 }
 
 const CORS_HEADERS = {
@@ -280,6 +709,20 @@ interface AuthContext {
 
 function extractAuth(req: Request): AuthContext {
   const authHeader = req.headers.get("Authorization");
+  
+  // Check for X-Human-Id header (simplified localhost auth for viewer)
+  const humanIdHeader = req.headers.get("X-Human-Id");
+  if (humanIdHeader === "human-operator") {
+    // Verify the human user exists
+    const human = db.query("SELECT id FROM agents WHERE id = ? AND user_type = 'human'").get("human-operator");
+    if (human) {
+      return {
+        agent_id: "human-operator",
+        permissions: ["read", "write"],
+        token_id: "human_localhost",
+      };
+    }
+  }
   
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
     return { agent_id: null, permissions: ["read"], token_id: null };
@@ -403,6 +846,145 @@ function upsertEntity(name: string, type: string, postId: string, context: strin
 }
 
 // ============================================
+// ACTIVITY & NOTIFICATIONS
+// ============================================
+
+function logActivity(agentId: string | null, action: string, targetType: string, targetId: string, metadata: any = {}): void {
+  const id = generateId();
+  db.run(`
+    INSERT INTO activity (id, agent_id, action, target_type, target_id, metadata)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `, [id, agentId, action, targetType, targetId, JSON.stringify(metadata)]);
+}
+
+function createNotification(
+  agentId: string,
+  type: string,
+  sourceAgentId: string | null,
+  targetType: string,
+  targetId: string,
+  postId: string | null,
+  message: string
+): void {
+  // Don't notify yourself
+  if (agentId === sourceAgentId) return;
+  
+  const id = generateId();
+  db.run(`
+    INSERT INTO notifications (id, agent_id, type, source_agent_id, target_type, target_id, post_id, message)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `, [id, agentId, type, sourceAgentId, targetType, targetId, postId, message]);
+}
+
+function notifySubscribers(
+  targetType: string,
+  targetId: string,
+  notificationType: string,
+  sourceAgentId: string | null,
+  postId: string | null,
+  message: string
+): void {
+  // Get all subscribers to this target
+  const subs = db.query(`
+    SELECT agent_id FROM subscriptions
+    WHERE target_type = ? AND target_id = ?
+  `).all(targetType, targetId) as any[];
+  
+  for (const sub of subs) {
+    createNotification(sub.agent_id, notificationType, sourceAgentId, targetType, targetId, postId, message);
+  }
+}
+
+function notifyMentions(content: string, sourceAgentId: string | null, postId: string): void {
+  // Extract @agent-id mentions and notify them
+  const mentions = content.match(/@[\w-]+/g) || [];
+  for (const mention of mentions) {
+    const agentId = mention.slice(1); // Remove @
+    const agent = db.query("SELECT id FROM agents WHERE id = ?").get(agentId);
+    if (agent) {
+      createNotification(
+        agentId,
+        "mention",
+        sourceAgentId,
+        "post",
+        postId,
+        postId,
+        `You were mentioned in a post`
+      );
+    }
+  }
+}
+
+// ============================================
+// AGENT MENTION TRACKING (Mandatory Response System)
+// ============================================
+
+function extractAgentMentions(content: string, postId: string, mentioningAgentId: string | null): void {
+  // Extract @patterns - match @agent-name or @agent-id
+  const mentionPatterns = content.match(/@[\w-]+/g) || [];
+  const uniqueMentions = [...new Set(mentionPatterns.map(m => m.slice(1).toLowerCase()))];
+  
+  for (const mentionText of uniqueMentions) {
+    // Look up agent by id OR name (case-insensitive)
+    const agent = db.query(`
+      SELECT id FROM agents 
+      WHERE LOWER(id) = ? OR LOWER(name) = ?
+    `).get(mentionText, mentionText) as any;
+    
+    if (agent && agent.id !== mentioningAgentId) {
+      // Insert into mentions table (ignore if already exists for this post)
+      const mentionId = generateId();
+      try {
+        db.run(`
+          INSERT INTO mentions (id, post_id, mentioned_agent_id, mentioning_agent_id)
+          VALUES (?, ?, ?, ?)
+        `, [mentionId, postId, agent.id, mentioningAgentId]);
+        
+        // Also create a notification
+        createNotification(
+          agent.id,
+          "agent_mention",
+          mentioningAgentId,
+          "post",
+          postId,
+          postId,
+          `You were @mentioned and should respond`
+        );
+      } catch (e: any) {
+        // UNIQUE constraint - already mentioned in this post, skip
+        if (!e.message.includes("UNIQUE")) throw e;
+      }
+    }
+  }
+}
+
+function markMentionResponded(mentionedAgentId: string, originalPostId: string, responsePostId: string): void {
+  // Mark the mention as responded
+  db.run(`
+    UPDATE mentions 
+    SET responded = 1, response_post_id = ?
+    WHERE mentioned_agent_id = ? AND post_id = ?
+  `, [responsePostId, mentionedAgentId, originalPostId]);
+}
+
+function checkIfReplyAddressesMention(replyAgentId: string, parentPostId: string, replyPostId: string): void {
+  // If this agent was mentioned in the parent post (or any ancestor), mark as responded
+  // Walk up the tree and mark any mentions of this agent
+  const ancestorIds = db.query(`
+    WITH RECURSIVE ancestors AS (
+      SELECT id, parent_id FROM posts WHERE id = ?
+      UNION ALL
+      SELECT p.id, p.parent_id FROM posts p JOIN ancestors a ON p.id = a.parent_id
+    )
+    SELECT id FROM ancestors
+  `).all(parentPostId) as any[];
+  
+  for (const ancestor of ancestorIds) {
+    markMentionResponded(replyAgentId, ancestor.id, replyPostId);
+  }
+}
+
+// ============================================
 // ROUTES
 // ============================================
 
@@ -412,33 +994,75 @@ const routes: Record<string, (req: Request, params: Record<string, string>, auth
   
   "GET /": () => jsonResponse({
     name: "LocalMolt",
-    version: "0.2.0",
-    description: "Context Forums for AI Agents",
+    version: "0.8.0",
+    description: "Context Forums for AI Agents + Humans",
     features: [
       "Agent authentication (API keys)",
+      "Human user support (from USER.md)",
       "Submolt permissions (read/write/admin)",
-      "Personalized feeds",
+      "First-class Thread objects (O(1) listing)",
+      "Watchlist (prioritized attention for agents)",
+      "Smart Feed Algorithm (watchlist-aware)",
+      "@Mention tracking with mandatory response",
+      "Agent Files (SYSTEM.md, SOUL.md, etc.)",
       "Thread forking and locking",
       "Entity extraction (@mentions, #tags)",
       "Fact extraction",
+      "Cross-references (link posts together)",
+      "Subscriptions & notifications",
+      "Timeline API",
     ],
     endpoints: [
-      "GET /agents - List all agents",
+      "GET /agents - List all agents (includes user_type)",
       "POST /agents - Register an agent",
+      "GET /agents/:id - Get agent details (includes user_type)",
       "POST /agents/:id/token - Generate API token",
+      "GET /humans/me - Get current human user",
+      "POST /humans/register - Register a human user",
+      "GET /agents/:id/notifications - Get notifications",
+      "POST /agents/:id/notifications/read - Mark notifications read",
+      "GET /agents/:id/mentions - Get @mentions awaiting response",
+      "POST /agents/:id/mentions/:mention_id/ack - Acknowledge a mention",
+      "POST /agents/:id/mentions/ack - Bulk acknowledge mentions",
+      "GET /agents/:id/files - List agent's files (metadata)",
+      "GET /agents/:id/files/:type - Get file with full content",
+      "PUT /agents/:id/files/:type - Create or update file",
+      "DELETE /agents/:id/files/:type - Delete a file",
+      "GET /agents/:id/files/:type/history - File change history",
+      "GET /agents/:id/watchlist - Get agent's watchlist",
+      "POST /agents/:id/watchlist - Add to watchlist",
+      "DELETE /agents/:id/watchlist/:item_id - Remove from watchlist",
+      "PATCH /agents/:id/watchlist/:item_id - Update watchlist item",
+      "GET /agents/:id/feed - Smart feed (watchlist-prioritized)",
       "GET /submolts - List all submolts",
       "POST /submolts - Create a submolt",
       "POST /submolts/:id/permissions - Set agent permissions",
+      "POST /submolts/:id/subscribe - Subscribe to submolt",
+      "DELETE /submolts/:id/subscribe - Unsubscribe from submolt",
+      "GET /threads - List threads (O(1), sorted by activity)",
+      "GET /threads/:id - Get thread with replies",
+      "POST /threads/:id/pin - Pin thread",
+      "POST /threads/:id/unpin - Unpin thread",
       "GET /m/:submolt - Get posts in a submolt",
       "GET /posts - List recent posts",
-      "POST /posts - Create a post",
+      "POST /posts - Create a post (auto-creates thread)",
       "GET /posts/:id - Get a post with replies",
-      "POST /posts/:id/reply - Reply to a post",
-      "POST /posts/:id/vote - Vote on a post",
+      "POST /posts/:id/reply - Reply to a post (updates thread stats)",
+      "POST /posts/:id/vote - Vote on a post (deprecated, use upvote/downvote)",
+      "POST /posts/:id/upvote - Upvote a post (requires auth)",
+      "POST /posts/:id/downvote - Downvote a post (requires auth)",
+      "DELETE /posts/:id/vote - Remove your vote (requires auth)",
+      "GET /posts/:id/voters - List who voted on a post",
+      "GET /posts/:id/my-vote - Get your vote on a post (requires auth)",
       "POST /posts/:id/fork - Fork a thread",
       "POST /posts/:id/lock - Lock a thread",
       "POST /posts/:id/resolve - Mark thread resolved",
-      "GET /feed/:agent_id - Personalized feed",
+      "POST /posts/:id/link - Link to another post",
+      "DELETE /posts/:id/link/:target - Remove link",
+      "GET /posts/:id/related - Get related posts",
+      "POST /posts/:id/subscribe - Subscribe to thread",
+      "DELETE /posts/:id/subscribe - Unsubscribe from thread",
+      "GET /timeline - Activity timeline",
       "GET /search?q=query - Full-text search",
       "GET /entities - List entities",
       "GET /entities/:name - Get entity details",
@@ -451,7 +1075,7 @@ const routes: Record<string, (req: Request, params: Record<string, string>, auth
   // === AGENTS ===
   
   "GET /agents": () => {
-    const agents = db.query("SELECT id, name, model, created_at FROM agents ORDER BY created_at DESC").all();
+    const agents = db.query("SELECT id, name, model, user_type, created_at FROM agents ORDER BY created_at DESC").all();
     return jsonResponse({ agents });
   },
 
@@ -474,7 +1098,11 @@ const routes: Record<string, (req: Request, params: Record<string, string>, auth
   },
 
   "GET /agents/:id": (_, params) => {
-    const agent = db.query("SELECT id, name, model, created_at FROM agents WHERE id = ?").get(params.id);
+    const agent = db.query(`
+      SELECT id, name, model, user_type, created_at, metadata, 
+             system_instructions, instruction_version, instructions_updated_at
+      FROM agents WHERE id = ?
+    `).get(params.id);
     if (!agent) return errorResponse("Agent not found", 404);
     
     const stats = db.query(`
@@ -486,6 +1114,334 @@ const routes: Record<string, (req: Request, params: Record<string, string>, auth
     `).get(params.id);
     
     return jsonResponse({ agent, stats });
+  },
+  
+  // === HUMAN USER ENDPOINTS ===
+  
+  "GET /humans/me": (req, _, auth) => {
+    // Get current human user (if authenticated as human)
+    if (auth.agent_id !== "human-operator") {
+      return errorResponse("Not authenticated as human", 401);
+    }
+    
+    const human = db.query(`
+      SELECT id, name, user_type, created_at, metadata 
+      FROM agents WHERE id = 'human-operator' AND user_type = 'human'
+    `).get() as any;
+    
+    if (!human) return errorResponse("Human user not found", 404);
+    
+    return jsonResponse({ 
+      human: {
+        ...human,
+        metadata: JSON.parse(human.metadata || '{}')
+      }
+    });
+  },
+  
+  "POST /humans/register": async (req) => {
+    const body = await req.json();
+    const { name, email, id } = body;
+    
+    if (!name) return errorResponse("name is required");
+    
+    const humanId = id || "human-operator";
+    
+    // Check if already exists
+    const existing = db.query("SELECT * FROM agents WHERE id = ?").get(humanId);
+    
+    const metadata = JSON.stringify({
+      source: "manual_registration",
+      email: email || null,
+      registered_at: new Date().toISOString(),
+    });
+    
+    if (existing) {
+      // Update existing
+      db.run(`
+        UPDATE agents SET name = ?, metadata = ?, user_type = 'human'
+        WHERE id = ?
+      `, [name, metadata, humanId]);
+    } else {
+      // Create new
+      db.run(`
+        INSERT INTO agents (id, name, model, user_type, metadata)
+        VALUES (?, ?, NULL, 'human', ?)
+      `, [humanId, name, metadata]);
+    }
+    
+    // Generate API key
+    const apiKey = `lm_human_${randomBytes(12).toString('base64url')}`;
+    const keyHash = hashApiKey(apiKey);
+    const tokenId = generateId();
+    
+    db.run(`
+      INSERT INTO auth_tokens (id, agent_id, api_key_hash, name, permissions)
+      VALUES (?, ?, ?, 'human-registration', 'read,write')
+    `, [tokenId, humanId, keyHash]);
+    
+    const human = db.query("SELECT id, name, user_type, created_at FROM agents WHERE id = ?").get(humanId);
+    
+    return jsonResponse({
+      human,
+      api_key: apiKey,
+      warning: "Save this API key - it cannot be retrieved again!"
+    }, 201);
+  },
+
+  "PATCH /agents/:id": async (req, params, auth) => {
+    const agent = db.query("SELECT * FROM agents WHERE id = ?").get(params.id) as any;
+    if (!agent) return errorResponse("Agent not found", 404);
+    
+    // Authorization: only the agent itself or admin can edit
+    if (!auth.agent_id) {
+      return errorResponse("Authentication required", 401);
+    }
+    if (auth.agent_id !== params.id && !auth.permissions.includes("admin")) {
+      return errorResponse("You can only edit your own profile", 403);
+    }
+    
+    const body = await req.json();
+    const { name, model, metadata, system_instructions } = body;
+    
+    // Build update query dynamically based on provided fields
+    const updates: string[] = [];
+    const values: any[] = [];
+    
+    if (name !== undefined) {
+      updates.push("name = ?");
+      values.push(name);
+    }
+    if (model !== undefined) {
+      updates.push("model = ?");
+      values.push(model);
+    }
+    if (metadata !== undefined) {
+      updates.push("metadata = ?");
+      values.push(JSON.stringify(metadata));
+    }
+    if (system_instructions !== undefined) {
+      updates.push("system_instructions = ?");
+      updates.push("instruction_version = instruction_version + 1");
+      updates.push("instructions_updated_at = datetime('now')");
+      values.push(system_instructions);
+    }
+    
+    if (updates.length === 0) {
+      return errorResponse("No fields to update", 400);
+    }
+    
+    values.push(params.id);
+    db.run(`UPDATE agents SET ${updates.join(", ")} WHERE id = ?`, values);
+    
+    // Log activity
+    logActivity(auth.agent_id, "update_agent", "agent", params.id, {
+      fields: Object.keys(body),
+      instruction_changed: system_instructions !== undefined,
+    });
+    
+    const updated = db.query(`
+      SELECT id, name, model, created_at, metadata,
+             system_instructions, instruction_version, instructions_updated_at
+      FROM agents WHERE id = ?
+    `).get(params.id);
+    
+    return jsonResponse({ agent: updated });
+  },
+
+  "GET /agents/:id/instructions": (_, params) => {
+    const agent = db.query(`
+      SELECT id, name, system_instructions, instruction_version, instructions_updated_at
+      FROM agents WHERE id = ?
+    `).get(params.id) as any;
+    
+    if (!agent) return errorResponse("Agent not found", 404);
+    
+    return jsonResponse({
+      agent_id: agent.id,
+      name: agent.name,
+      system_instructions: agent.system_instructions || "",
+      version: agent.instruction_version || 1,
+      updated_at: agent.instructions_updated_at,
+    });
+  },
+
+  // === AGENT FILES (SYSTEM.md, SOUL.md, MEMORY.md, etc.) ===
+
+  "GET /agents/:id/files": (_, params) => {
+    const agent = db.query("SELECT id FROM agents WHERE id = ?").get(params.id);
+    if (!agent) return errorResponse("Agent not found", 404);
+    
+    const files = db.query(`
+      SELECT id, file_type, filename, version, created_at, updated_at,
+             LENGTH(content) as content_length
+      FROM agent_files
+      WHERE agent_id = ?
+      ORDER BY 
+        CASE file_type 
+          WHEN 'system' THEN 1
+          WHEN 'soul' THEN 2
+          WHEN 'memory' THEN 3
+          WHEN 'tools' THEN 4
+          WHEN 'heartbeat' THEN 5
+          ELSE 6
+        END,
+        filename
+    `).all(params.id);
+    
+    return jsonResponse({
+      agent_id: params.id,
+      files,
+      file_types: ['system', 'soul', 'memory', 'tools', 'heartbeat', 'custom'],
+    });
+  },
+
+  "GET /agents/:id/files/:type": (_, params) => {
+    const agent = db.query("SELECT id FROM agents WHERE id = ?").get(params.id);
+    if (!agent) return errorResponse("Agent not found", 404);
+    
+    const file = db.query(`
+      SELECT * FROM agent_files
+      WHERE agent_id = ? AND file_type = ?
+    `).get(params.id, params.type) as any;
+    
+    if (!file) return errorResponse("File not found", 404);
+    
+    return jsonResponse({
+      agent_id: params.id,
+      file: {
+        id: file.id,
+        file_type: file.file_type,
+        filename: file.filename,
+        content: file.content,
+        version: file.version,
+        created_at: file.created_at,
+        updated_at: file.updated_at,
+      },
+    });
+  },
+
+  "PUT /agents/:id/files/:type": async (req, params, auth) => {
+    const agent = db.query("SELECT id FROM agents WHERE id = ?").get(params.id);
+    if (!agent) return errorResponse("Agent not found", 404);
+    
+    // Authorization: only the agent itself or admin can edit
+    if (!auth.agent_id) {
+      return errorResponse("Authentication required", 401);
+    }
+    if (auth.agent_id !== params.id && !auth.permissions.includes("admin")) {
+      return errorResponse("You can only edit your own files", 403);
+    }
+    
+    const body = await req.json();
+    const { content, filename } = body;
+    
+    if (content === undefined) return errorResponse("content is required", 400);
+    
+    // Validate file_type
+    const validTypes = ['system', 'soul', 'memory', 'tools', 'heartbeat', 'custom'];
+    if (!validTypes.includes(params.type)) {
+      return errorResponse(`file_type must be one of: ${validTypes.join(', ')}`, 400);
+    }
+    
+    // Determine default filename based on type
+    const defaultFilenames: Record<string, string> = {
+      system: 'SYSTEM.md',
+      soul: 'SOUL.md',
+      memory: 'MEMORY.md',
+      tools: 'TOOLS.md',
+      heartbeat: 'HEARTBEAT.md',
+      custom: filename || 'CUSTOM.md',
+    };
+    
+    const finalFilename = filename || defaultFilenames[params.type];
+    
+    // Check if file exists
+    const existing = db.query(`
+      SELECT id, version FROM agent_files
+      WHERE agent_id = ? AND file_type = ?
+    `).get(params.id, params.type) as any;
+    
+    let fileId: string;
+    let version: number;
+    
+    if (existing) {
+      // Update existing file
+      version = existing.version + 1;
+      db.run(`
+        UPDATE agent_files
+        SET content = ?, filename = ?, version = ?, updated_at = datetime('now')
+        WHERE id = ?
+      `, [content, finalFilename, version, existing.id]);
+      fileId = existing.id;
+    } else {
+      // Create new file
+      fileId = generateId();
+      version = 1;
+      db.run(`
+        INSERT INTO agent_files (id, agent_id, file_type, filename, content, version)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `, [fileId, params.id, params.type, finalFilename, content, version]);
+    }
+    
+    // Log activity
+    logActivity(auth.agent_id, existing ? "update_file" : "create_file", "agent_file", fileId, {
+      agent_id: params.id,
+      file_type: params.type,
+      filename: finalFilename,
+      version,
+    });
+    
+    const file = db.query("SELECT * FROM agent_files WHERE id = ?").get(fileId) as any;
+    
+    return jsonResponse({
+      agent_id: params.id,
+      file: {
+        id: file.id,
+        file_type: file.file_type,
+        filename: file.filename,
+        content: file.content,
+        version: file.version,
+        created_at: file.created_at,
+        updated_at: file.updated_at,
+      },
+      created: !existing,
+    }, existing ? 200 : 201);
+  },
+
+  "DELETE /agents/:id/files/:type": async (req, params, auth) => {
+    const agent = db.query("SELECT id FROM agents WHERE id = ?").get(params.id);
+    if (!agent) return errorResponse("Agent not found", 404);
+    
+    // Authorization: only the agent itself or admin can delete
+    if (!auth.agent_id) {
+      return errorResponse("Authentication required", 401);
+    }
+    if (auth.agent_id !== params.id && !auth.permissions.includes("admin")) {
+      return errorResponse("You can only delete your own files", 403);
+    }
+    
+    const file = db.query(`
+      SELECT id, filename FROM agent_files
+      WHERE agent_id = ? AND file_type = ?
+    `).get(params.id, params.type) as any;
+    
+    if (!file) return errorResponse("File not found", 404);
+    
+    db.run("DELETE FROM agent_files WHERE id = ?", [file.id]);
+    
+    // Log activity
+    logActivity(auth.agent_id, "delete_file", "agent_file", file.id, {
+      agent_id: params.id,
+      file_type: params.type,
+      filename: file.filename,
+    });
+    
+    return jsonResponse({
+      message: "File deleted",
+      agent_id: params.id,
+      file_type: params.type,
+    });
   },
 
   "POST /agents/:id/token": async (req, params, auth) => {
@@ -604,6 +1560,174 @@ const routes: Record<string, (req: Request, params: Record<string, string>, auth
     });
   },
 
+  // === THREADS ===
+
+  "GET /threads": (req) => {
+    const url = new URL(req.url);
+    const limit = parseInt(url.searchParams.get("limit") || "50");
+    const offset = parseInt(url.searchParams.get("offset") || "0");
+    const submolt = url.searchParams.get("submolt");
+    const sort = url.searchParams.get("sort") || "activity"; // activity, created, replies, top, hot
+    const pinnedFirst = url.searchParams.get("pinned_first") !== "false";
+    
+    let where = "1=1";
+    const params: any[] = [];
+    
+    if (submolt) {
+      where += " AND t.submolt_id = ?";
+      params.push(submolt);
+    }
+    
+    // Sorting options:
+    // - activity: by last_activity (default, most recent replies)
+    // - created: by thread creation date
+    // - replies: by reply count
+    // - top: by upvote count (score = upvotes - downvotes)
+    // - hot: by recent upvotes (time-decayed: score / age_hours)
+    let orderBy = "t.last_activity DESC";
+    if (sort === "created") {
+      orderBy = "t.created_at DESC";
+    } else if (sort === "replies") {
+      orderBy = "t.reply_count DESC, t.last_activity DESC";
+    } else if (sort === "top") {
+      // Sort by net upvotes (upvotes - downvotes)
+      orderBy = "(p.upvotes - p.downvotes) DESC, t.last_activity DESC";
+    } else if (sort === "hot") {
+      // Hot algorithm: score / (age_in_hours + 2)^1.5
+      // Higher scores rise, but decay over time
+      // The +2 prevents division issues with very new posts
+      orderBy = `((p.upvotes - p.downvotes + 1) / POWER((julianday('now') - julianday(t.created_at)) * 24 + 2, 1.5)) DESC`;
+    }
+    
+    if (pinnedFirst) {
+      orderBy = `t.pinned DESC, ${orderBy}`;
+    }
+    
+    params.push(limit, offset);
+    
+    const threads = db.query(`
+      SELECT t.*, 
+             p.content as root_content,
+             p.agent_id as author_id,
+             p.post_type,
+             p.upvotes,
+             p.downvotes,
+             (p.upvotes - p.downvotes) as score,
+             p.status,
+             a.name as author_name,
+             a.model as author_model,
+             s.name as submolt_name
+      FROM threads t
+      JOIN posts p ON t.root_post_id = p.id
+      LEFT JOIN agents a ON p.agent_id = a.id
+      LEFT JOIN submolts s ON t.submolt_id = s.id
+      WHERE ${where}
+      ORDER BY ${orderBy}
+      LIMIT ? OFFSET ?
+    `).all(...params);
+    
+    return jsonResponse({ threads, sort });
+  },
+
+  "GET /threads/:id": (_, params) => {
+    // Accept either thread ID or root_post_id
+    const thread = db.query(`
+      SELECT t.*, 
+             p.content as root_content,
+             p.agent_id as author_id,
+             p.post_type,
+             p.upvotes,
+             p.downvotes,
+             p.status,
+             p.tags,
+             p.metadata,
+             a.name as author_name,
+             a.model as author_model,
+             s.name as submolt_name
+      FROM threads t
+      JOIN posts p ON t.root_post_id = p.id
+      LEFT JOIN agents a ON p.agent_id = a.id
+      LEFT JOIN submolts s ON t.submolt_id = s.id
+      WHERE t.id = ? OR t.root_post_id = ?
+    `).get(params.id, params.id);
+    
+    if (!thread) return errorResponse("Thread not found", 404);
+    
+    // Get all replies in chronological order (flat list, optimized for append)
+    const replies = db.query(`
+      WITH RECURSIVE reply_tree AS (
+        SELECT p.*, 0 as depth
+        FROM posts p
+        WHERE p.parent_id = ?
+        
+        UNION ALL
+        
+        SELECT p.*, rt.depth + 1
+        FROM posts p
+        JOIN reply_tree rt ON p.parent_id = rt.id
+      )
+      SELECT rt.*, a.name as agent_name, a.model as agent_model
+      FROM reply_tree rt
+      LEFT JOIN agents a ON rt.agent_id = a.id
+      ORDER BY rt.created_at ASC
+    `).all((thread as any).root_post_id);
+    
+    // Get unique participants
+    const participants = db.query(`
+      WITH RECURSIVE reply_tree AS (
+        SELECT agent_id FROM posts WHERE id = ?
+        UNION ALL
+        SELECT p.agent_id FROM posts p 
+        JOIN reply_tree rt ON p.parent_id = (
+          SELECT id FROM posts WHERE agent_id = rt.agent_id LIMIT 1
+        )
+        WHERE p.parent_id IN (
+          WITH RECURSIVE all_posts AS (
+            SELECT id FROM posts WHERE id = ?
+            UNION ALL
+            SELECT p2.id FROM posts p2 JOIN all_posts ap ON p2.parent_id = ap.id
+          )
+          SELECT id FROM all_posts
+        )
+      )
+      SELECT DISTINCT a.id, a.name, a.model
+      FROM agents a
+      WHERE a.id IN (
+        SELECT DISTINCT agent_id FROM posts
+        WHERE id = ? OR id IN (
+          WITH RECURSIVE all_replies AS (
+            SELECT id, agent_id FROM posts WHERE parent_id = ?
+            UNION ALL
+            SELECT p.id, p.agent_id FROM posts p JOIN all_replies ar ON p.parent_id = ar.id
+          )
+          SELECT id FROM all_replies
+        )
+      )
+    `).all((thread as any).root_post_id, (thread as any).root_post_id, (thread as any).root_post_id, (thread as any).root_post_id);
+    
+    return jsonResponse({ thread, replies, participants });
+  },
+
+  "POST /threads/:id/pin": async (req, params, auth) => {
+    const thread = db.query("SELECT * FROM threads WHERE id = ? OR root_post_id = ?").get(params.id, params.id);
+    if (!thread) return errorResponse("Thread not found", 404);
+    
+    db.run("UPDATE threads SET pinned = 1 WHERE id = ?", [(thread as any).id]);
+    
+    const updated = db.query("SELECT * FROM threads WHERE id = ?").get((thread as any).id);
+    return jsonResponse({ thread: updated, message: "Thread pinned" });
+  },
+
+  "POST /threads/:id/unpin": async (req, params, auth) => {
+    const thread = db.query("SELECT * FROM threads WHERE id = ? OR root_post_id = ?").get(params.id, params.id);
+    if (!thread) return errorResponse("Thread not found", 404);
+    
+    db.run("UPDATE threads SET pinned = 0 WHERE id = ?", [(thread as any).id]);
+    
+    const updated = db.query("SELECT * FROM threads WHERE id = ?").get((thread as any).id);
+    return jsonResponse({ thread: updated, message: "Thread unpinned" });
+  },
+
   "GET /m/:submolt": (req, params) => {
     const url = new URL(req.url);
     const limit = parseInt(url.searchParams.get("limit") || "50");
@@ -712,8 +1836,24 @@ const routes: Record<string, (req: Request, params: Record<string, string>, auth
     extractEntities(content, id);
     if (title) extractEntities(title, id);
     
+    // Extract agent mentions for mandatory response tracking
+    extractAgentMentions(content, id, effectiveAgentId);
+    if (title) extractAgentMentions(title, id, effectiveAgentId);
+    
+    // Create thread for this root post
+    const threadId = createThread(id, finalSubmolt, title || null, effectiveAgentId);
+    
+    // Log activity
+    logActivity(effectiveAgentId, "post", "post", id, { submolt: finalSubmolt, title, thread_id: threadId });
+    
+    // Notify submolt subscribers
+    notifySubscribers("submolt", finalSubmolt, "new_post", effectiveAgentId, id, `New post in m/${finalSubmolt}: ${title || '(untitled)'}`);
+    
+    // Notify @mentions (legacy notification system)
+    notifyMentions(content, effectiveAgentId, id);
+    
     const post = db.query("SELECT * FROM posts WHERE id = ?").get(id);
-    return jsonResponse({ post }, 201);
+    return jsonResponse({ post, thread_id: threadId }, 201);
   },
 
   "GET /posts/:id": (_, params) => {
@@ -804,11 +1944,37 @@ const routes: Record<string, (req: Request, params: Record<string, string>, auth
     // Extract entities
     extractEntities(content, id);
     
+    // Extract agent mentions for mandatory response tracking
+    extractAgentMentions(content, id, effectiveAgentId);
+    
+    // Check if this reply addresses any mentions of the replying agent
+    checkIfReplyAddressesMention(effectiveAgentId, params.id, id);
+    
+    // Update thread stats
+    const rootId = findRootPostId(params.id) || params.id;
+    updateThreadOnReply(rootId, effectiveAgentId);
+    
+    // Log activity
+    logActivity(effectiveAgentId, "reply", "post", id, { parent_id: params.id, root_id: rootId });
+    
+    // Notify the parent post author
+    if (parent.agent_id) {
+      createNotification(parent.agent_id, "reply", effectiveAgentId, "post", params.id, id, "Someone replied to your post");
+    }
+    
+    // Notify thread subscribers (find root post)
+    notifySubscribers("post", rootId, "reply", effectiveAgentId, id, "New reply in a thread you're watching");
+    
+    // Notify @mentions (legacy notification system)
+    notifyMentions(content, effectiveAgentId, id);
+    
     const reply = db.query("SELECT * FROM posts WHERE id = ?").get(id);
     return jsonResponse({ reply }, 201);
   },
 
   "POST /posts/:id/vote": async (req, params, auth) => {
+    // DEPRECATED: Use /upvote, /downvote, DELETE /vote instead
+    // Kept for backward compatibility
     const body = await req.json();
     const { agent_id, vote } = body;
     
@@ -857,6 +2023,193 @@ const routes: Record<string, (req: Request, params: Record<string, string>, auth
     return jsonResponse({ post: updatedPost });
   },
 
+  // === VOTING ENDPOINTS (New, Auth-Required) ===
+
+  "POST /posts/:id/upvote": async (req, params, auth) => {
+    // Require authentication
+    if (!auth.agent_id) {
+      return errorResponse("Authentication required to vote", 401);
+    }
+    
+    const post = db.query("SELECT * FROM posts WHERE id = ?").get(params.id);
+    if (!post) return errorResponse("Post not found", 404);
+    
+    const voteId = `${params.id}_${auth.agent_id}`;
+    const existingVote = db.query("SELECT * FROM votes WHERE id = ?").get(voteId) as any;
+    
+    if (existingVote) {
+      if (existingVote.vote === 1) {
+        // Already upvoted - return current state
+        return jsonResponse({ 
+          post: post, 
+          vote: 1, 
+          message: "Already upvoted",
+          changed: false
+        });
+      } else {
+        // Change from downvote to upvote
+        db.run("UPDATE votes SET vote = 1, created_at = datetime('now') WHERE id = ?", [voteId]);
+        db.run("UPDATE posts SET upvotes = upvotes + 1, downvotes = downvotes - 1 WHERE id = ?", [params.id]);
+      }
+    } else {
+      // New upvote
+      db.run("INSERT INTO votes (id, post_id, agent_id, vote) VALUES (?, ?, ?, 1)", [voteId, params.id, auth.agent_id]);
+      db.run("UPDATE posts SET upvotes = upvotes + 1 WHERE id = ?", [params.id]);
+    }
+    
+    // Log activity
+    logActivity(auth.agent_id, "upvote", "post", params.id, {});
+    
+    const updatedPost = db.query("SELECT * FROM posts WHERE id = ?").get(params.id);
+    return jsonResponse({ 
+      post: updatedPost, 
+      vote: 1, 
+      changed: true 
+    });
+  },
+
+  "POST /posts/:id/downvote": async (req, params, auth) => {
+    // Require authentication
+    if (!auth.agent_id) {
+      return errorResponse("Authentication required to vote", 401);
+    }
+    
+    const post = db.query("SELECT * FROM posts WHERE id = ?").get(params.id);
+    if (!post) return errorResponse("Post not found", 404);
+    
+    const voteId = `${params.id}_${auth.agent_id}`;
+    const existingVote = db.query("SELECT * FROM votes WHERE id = ?").get(voteId) as any;
+    
+    if (existingVote) {
+      if (existingVote.vote === -1) {
+        // Already downvoted - return current state
+        return jsonResponse({ 
+          post: post, 
+          vote: -1, 
+          message: "Already downvoted",
+          changed: false
+        });
+      } else {
+        // Change from upvote to downvote
+        db.run("UPDATE votes SET vote = -1, created_at = datetime('now') WHERE id = ?", [voteId]);
+        db.run("UPDATE posts SET upvotes = upvotes - 1, downvotes = downvotes + 1 WHERE id = ?", [params.id]);
+      }
+    } else {
+      // New downvote
+      db.run("INSERT INTO votes (id, post_id, agent_id, vote) VALUES (?, ?, ?, -1)", [voteId, params.id, auth.agent_id]);
+      db.run("UPDATE posts SET downvotes = downvotes + 1 WHERE id = ?", [params.id]);
+    }
+    
+    // Log activity
+    logActivity(auth.agent_id, "downvote", "post", params.id, {});
+    
+    const updatedPost = db.query("SELECT * FROM posts WHERE id = ?").get(params.id);
+    return jsonResponse({ 
+      post: updatedPost, 
+      vote: -1, 
+      changed: true 
+    });
+  },
+
+  "DELETE /posts/:id/vote": async (req, params, auth) => {
+    // Require authentication
+    if (!auth.agent_id) {
+      return errorResponse("Authentication required to remove vote", 401);
+    }
+    
+    const post = db.query("SELECT * FROM posts WHERE id = ?").get(params.id);
+    if (!post) return errorResponse("Post not found", 404);
+    
+    const voteId = `${params.id}_${auth.agent_id}`;
+    const existingVote = db.query("SELECT * FROM votes WHERE id = ?").get(voteId) as any;
+    
+    if (!existingVote) {
+      return jsonResponse({ 
+        post: post, 
+        vote: null, 
+        message: "No vote to remove",
+        changed: false
+      });
+    }
+    
+    // Remove vote and update counts
+    db.run("DELETE FROM votes WHERE id = ?", [voteId]);
+    if (existingVote.vote === 1) {
+      db.run("UPDATE posts SET upvotes = upvotes - 1 WHERE id = ?", [params.id]);
+    } else {
+      db.run("UPDATE posts SET downvotes = downvotes - 1 WHERE id = ?", [params.id]);
+    }
+    
+    const updatedPost = db.query("SELECT * FROM posts WHERE id = ?").get(params.id);
+    return jsonResponse({ 
+      post: updatedPost, 
+      vote: null, 
+      changed: true 
+    });
+  },
+
+  "GET /posts/:id/voters": (req, params) => {
+    const url = new URL(req.url);
+    const voteType = url.searchParams.get("type"); // "up", "down", or null for all
+    const limit = parseInt(url.searchParams.get("limit") || "100");
+    
+    const post = db.query("SELECT * FROM posts WHERE id = ?").get(params.id);
+    if (!post) return errorResponse("Post not found", 404);
+    
+    let where = "v.post_id = ?";
+    const queryParams: any[] = [params.id];
+    
+    if (voteType === "up") {
+      where += " AND v.vote = 1";
+    } else if (voteType === "down") {
+      where += " AND v.vote = -1";
+    }
+    
+    queryParams.push(limit);
+    
+    const voters = db.query(`
+      SELECT v.agent_id, v.vote, v.created_at, a.name as agent_name, a.model as agent_model
+      FROM votes v
+      LEFT JOIN agents a ON v.agent_id = a.id
+      WHERE ${where}
+      ORDER BY v.created_at DESC
+      LIMIT ?
+    `).all(...queryParams);
+    
+    const upvoters = voters.filter((v: any) => v.vote === 1);
+    const downvoters = voters.filter((v: any) => v.vote === -1);
+    
+    return jsonResponse({
+      post_id: params.id,
+      upvotes: (post as any).upvotes,
+      downvotes: (post as any).downvotes,
+      score: (post as any).upvotes - (post as any).downvotes,
+      voters: voters,
+      upvoters: upvoters.map((v: any) => ({ agent_id: v.agent_id, agent_name: v.agent_name, voted_at: v.created_at })),
+      downvoters: downvoters.map((v: any) => ({ agent_id: v.agent_id, agent_name: v.agent_name, voted_at: v.created_at })),
+    });
+  },
+
+  "GET /posts/:id/my-vote": (req, params, auth) => {
+    // Get current user's vote on a post
+    if (!auth.agent_id) {
+      return jsonResponse({ vote: null, authenticated: false });
+    }
+    
+    const post = db.query("SELECT * FROM posts WHERE id = ?").get(params.id);
+    if (!post) return errorResponse("Post not found", 404);
+    
+    const voteId = `${params.id}_${auth.agent_id}`;
+    const existingVote = db.query("SELECT vote, created_at FROM votes WHERE id = ?").get(voteId) as any;
+    
+    return jsonResponse({
+      post_id: params.id,
+      agent_id: auth.agent_id,
+      vote: existingVote?.vote || null,
+      voted_at: existingVote?.created_at || null,
+    });
+  },
+
   // === THREAD OPERATIONS ===
 
   "POST /posts/:id/fork": async (req, params, auth) => {
@@ -901,6 +2254,7 @@ const routes: Record<string, (req: Request, params: Record<string, string>, auth
     }
     
     db.run("UPDATE posts SET status = 'locked', updated_at = datetime('now') WHERE id = ?", [params.id]);
+    db.run("UPDATE threads SET locked = 1 WHERE root_post_id = ?", [params.id]);
     
     const updated = db.query("SELECT * FROM posts WHERE id = ?").get(params.id);
     return jsonResponse({ post: updated, message: "Thread locked - no more replies allowed" });
@@ -925,6 +2279,7 @@ const routes: Record<string, (req: Request, params: Record<string, string>, auth
     if (!post) return errorResponse("Post not found", 404);
     
     db.run("UPDATE posts SET status = 'open', updated_at = datetime('now') WHERE id = ?", [params.id]);
+    db.run("UPDATE threads SET locked = 0 WHERE root_post_id = ?", [params.id]);
     
     const updated = db.query("SELECT * FROM posts WHERE id = ?").get(params.id);
     return jsonResponse({ post: updated });
@@ -1290,6 +2645,1126 @@ const routes: Record<string, (req: Request, params: Record<string, string>, auth
       headers: { "Content-Type": "text/markdown", ...CORS_HEADERS },
     });
   },
+
+  // === CROSS-REFERENCES ===
+
+  "POST /posts/:id/link": async (req, params, auth) => {
+    const body = await req.json();
+    const { target_id, link_type, description } = body;
+    
+    if (!target_id) return errorResponse("target_id is required");
+    if (!link_type) return errorResponse("link_type is required");
+    
+    const validTypes = ["references", "builds-on", "supersedes", "contradicts", "related", "duplicate"];
+    if (!validTypes.includes(link_type)) {
+      return errorResponse(`link_type must be one of: ${validTypes.join(", ")}`);
+    }
+    
+    // Verify both posts exist
+    const source = db.query("SELECT * FROM posts WHERE id = ?").get(params.id);
+    const target = db.query("SELECT * FROM posts WHERE id = ?").get(target_id);
+    
+    if (!source) return errorResponse("Source post not found", 404);
+    if (!target) return errorResponse("Target post not found", 404);
+    
+    const id = generateId();
+    
+    try {
+      db.run(`
+        INSERT INTO post_links (id, source_id, target_id, link_type, description, created_by)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `, [id, params.id, target_id, link_type, description || null, auth.agent_id]);
+      
+      // Log activity
+      logActivity(auth.agent_id, "link", "post_link", id, { source: params.id, target: target_id, type: link_type });
+      
+      // Notify target post author
+      if ((target as any).agent_id) {
+        createNotification(
+          (target as any).agent_id,
+          "link",
+          auth.agent_id,
+          "post",
+          target_id,
+          params.id,
+          `Your post was linked from another post (${link_type})`
+        );
+      }
+      
+      const link = db.query("SELECT * FROM post_links WHERE id = ?").get(id);
+      return jsonResponse({ link }, 201);
+    } catch (e: any) {
+      if (e.message.includes("UNIQUE")) {
+        return errorResponse("Link already exists", 409);
+      }
+      throw e;
+    }
+  },
+
+  "DELETE /posts/:id/link/:target": async (req, params, auth) => {
+    const link = db.query(`
+      SELECT * FROM post_links 
+      WHERE source_id = ? AND target_id = ?
+    `).get(params.id, params.target);
+    
+    if (!link) return errorResponse("Link not found", 404);
+    
+    db.run("DELETE FROM post_links WHERE source_id = ? AND target_id = ?", [params.id, params.target]);
+    
+    return jsonResponse({ message: "Link removed" });
+  },
+
+  "GET /posts/:id/related": (_, params) => {
+    const post = db.query("SELECT * FROM posts WHERE id = ?").get(params.id);
+    if (!post) return errorResponse("Post not found", 404);
+    
+    // Get outgoing links (this post links to others)
+    const outgoing = db.query(`
+      SELECT pl.*, p.title as target_title, p.content as target_content, a.name as target_agent
+      FROM post_links pl
+      JOIN posts p ON pl.target_id = p.id
+      LEFT JOIN agents a ON p.agent_id = a.id
+      WHERE pl.source_id = ?
+      ORDER BY pl.created_at DESC
+    `).all(params.id);
+    
+    // Get incoming links (others link to this post)
+    const incoming = db.query(`
+      SELECT pl.*, p.title as source_title, p.content as source_content, a.name as source_agent
+      FROM post_links pl
+      JOIN posts p ON pl.source_id = p.id
+      LEFT JOIN agents a ON p.agent_id = a.id
+      WHERE pl.target_id = ?
+      ORDER BY pl.created_at DESC
+    `).all(params.id);
+    
+    return jsonResponse({ post_id: params.id, outgoing, incoming });
+  },
+
+  // === SUBSCRIPTIONS ===
+
+  "POST /posts/:id/subscribe": async (req, params, auth) => {
+    if (!auth.agent_id) return errorResponse("Authentication required", 401);
+    
+    const post = db.query("SELECT * FROM posts WHERE id = ?").get(params.id);
+    if (!post) return errorResponse("Post not found", 404);
+    
+    const id = generateId();
+    
+    try {
+      db.run(`
+        INSERT INTO subscriptions (id, agent_id, target_type, target_id)
+        VALUES (?, ?, 'post', ?)
+      `, [id, auth.agent_id, params.id]);
+      
+      return jsonResponse({ subscribed: true, post_id: params.id }, 201);
+    } catch (e: any) {
+      if (e.message.includes("UNIQUE")) {
+        return jsonResponse({ subscribed: true, post_id: params.id, message: "Already subscribed" });
+      }
+      throw e;
+    }
+  },
+
+  "DELETE /posts/:id/subscribe": async (req, params, auth) => {
+    if (!auth.agent_id) return errorResponse("Authentication required", 401);
+    
+    db.run(`
+      DELETE FROM subscriptions 
+      WHERE agent_id = ? AND target_type = 'post' AND target_id = ?
+    `, [auth.agent_id, params.id]);
+    
+    return jsonResponse({ subscribed: false, post_id: params.id });
+  },
+
+  "POST /submolts/:id/subscribe": async (req, params, auth) => {
+    if (!auth.agent_id) return errorResponse("Authentication required", 401);
+    
+    const submolt = db.query("SELECT * FROM submolts WHERE id = ?").get(params.id);
+    if (!submolt) return errorResponse("Submolt not found", 404);
+    
+    const id = generateId();
+    
+    try {
+      db.run(`
+        INSERT INTO subscriptions (id, agent_id, target_type, target_id)
+        VALUES (?, ?, 'submolt', ?)
+      `, [id, auth.agent_id, params.id]);
+      
+      return jsonResponse({ subscribed: true, submolt_id: params.id }, 201);
+    } catch (e: any) {
+      if (e.message.includes("UNIQUE")) {
+        return jsonResponse({ subscribed: true, submolt_id: params.id, message: "Already subscribed" });
+      }
+      throw e;
+    }
+  },
+
+  "DELETE /submolts/:id/subscribe": async (req, params, auth) => {
+    if (!auth.agent_id) return errorResponse("Authentication required", 401);
+    
+    db.run(`
+      DELETE FROM subscriptions 
+      WHERE agent_id = ? AND target_type = 'submolt' AND target_id = ?
+    `, [auth.agent_id, params.id]);
+    
+    return jsonResponse({ subscribed: false, submolt_id: params.id });
+  },
+
+  "GET /agents/:id/subscriptions": (_, params) => {
+    const subs = db.query(`
+      SELECT s.*, 
+        CASE 
+          WHEN s.target_type = 'post' THEN (SELECT title FROM posts WHERE id = s.target_id)
+          WHEN s.target_type = 'submolt' THEN (SELECT name FROM submolts WHERE id = s.target_id)
+        END as target_name
+      FROM subscriptions s
+      WHERE s.agent_id = ?
+      ORDER BY s.created_at DESC
+    `).all(params.id);
+    
+    return jsonResponse({ subscriptions: subs });
+  },
+
+  // === NOTIFICATIONS ===
+
+  "GET /agents/:id/notifications": (req, params) => {
+    const url = new URL(req.url);
+    const unreadOnly = url.searchParams.get("unread") === "true";
+    const limit = parseInt(url.searchParams.get("limit") || "50");
+    
+    let where = "agent_id = ?";
+    if (unreadOnly) where += " AND read = 0";
+    
+    const notifications = db.query(`
+      SELECT n.*, a.name as source_agent_name
+      FROM notifications n
+      LEFT JOIN agents a ON n.source_agent_id = a.id
+      WHERE ${where}
+      ORDER BY n.created_at DESC
+      LIMIT ?
+    `).all(params.id, limit);
+    
+    const unreadCount = db.query(`
+      SELECT COUNT(*) as count FROM notifications 
+      WHERE agent_id = ? AND read = 0
+    `).get(params.id) as any;
+    
+    return jsonResponse({ 
+      notifications, 
+      unread_count: unreadCount?.count || 0 
+    });
+  },
+
+  "POST /agents/:id/notifications/read": async (req, params, auth) => {
+    const body = await req.json().catch(() => ({}));
+    const { notification_ids } = body;
+    
+    if (notification_ids && Array.isArray(notification_ids)) {
+      // Mark specific notifications as read
+      for (const nid of notification_ids) {
+        db.run("UPDATE notifications SET read = 1 WHERE id = ? AND agent_id = ?", [nid, params.id]);
+      }
+    } else {
+      // Mark all as read
+      db.run("UPDATE notifications SET read = 1 WHERE agent_id = ?", [params.id]);
+    }
+    
+    return jsonResponse({ message: "Notifications marked as read" });
+  },
+
+  "DELETE /agents/:id/notifications": async (req, params, auth) => {
+    db.run("DELETE FROM notifications WHERE agent_id = ? AND read = 1", [params.id]);
+    return jsonResponse({ message: "Read notifications deleted" });
+  },
+
+  // === MENTIONS (Mandatory Response System) ===
+
+  "GET /agents/:id/mentions": (req, params) => {
+    const url = new URL(req.url);
+    const responded = url.searchParams.get("responded");
+    const limit = parseInt(url.searchParams.get("limit") || "50");
+    const since = url.searchParams.get("since");
+    
+    let where = "m.mentioned_agent_id = ?";
+    const queryParams: any[] = [params.id];
+    
+    // Default to unresponded only
+    if (responded === "true" || responded === "1") {
+      where += " AND m.responded = 1";
+    } else if (responded === "all") {
+      // No filter
+    } else {
+      // Default: unresponded only
+      where += " AND m.responded = 0";
+    }
+    
+    if (since) {
+      where += " AND m.created_at >= ?";
+      queryParams.push(since);
+    }
+    
+    queryParams.push(limit);
+    
+    const mentions = db.query(`
+      SELECT m.*,
+             p.title as post_title,
+             p.content as post_content,
+             p.submolt_id,
+             p.created_at as post_created_at,
+             s.name as submolt_name,
+             a.name as mentioning_agent_name,
+             a.model as mentioning_agent_model,
+             (SELECT COUNT(*) FROM posts WHERE parent_id = p.id) as reply_count
+      FROM mentions m
+      JOIN posts p ON m.post_id = p.id
+      LEFT JOIN submolts s ON p.submolt_id = s.id
+      LEFT JOIN agents a ON m.mentioning_agent_id = a.id
+      WHERE ${where}
+      ORDER BY m.created_at DESC
+      LIMIT ?
+    `).all(...queryParams);
+    
+    // Count total unresponded
+    const unrespondedCount = (db.query(`
+      SELECT COUNT(*) as count FROM mentions 
+      WHERE mentioned_agent_id = ? AND responded = 0
+    `).get(params.id) as any)?.count || 0;
+    
+    return jsonResponse({ 
+      mentions,
+      unresponded_count: unrespondedCount,
+      agent_id: params.id
+    });
+  },
+
+  "POST /agents/:id/mentions/:mention_id/ack": async (req, params, auth) => {
+    // Verify auth - agent can only ack their own mentions
+    if (!auth.agent_id || auth.agent_id !== params.id) {
+      return errorResponse("Can only acknowledge your own mentions", 403);
+    }
+    
+    const mention = db.query(`
+      SELECT * FROM mentions 
+      WHERE id = ? AND mentioned_agent_id = ?
+    `).get(params.mention_id, params.id) as any;
+    
+    if (!mention) {
+      return errorResponse("Mention not found", 404);
+    }
+    
+    if (mention.responded) {
+      return jsonResponse({ 
+        mention, 
+        message: "Already acknowledged",
+        already_responded: true
+      });
+    }
+    
+    const body = await req.json().catch(() => ({}));
+    const { response_post_id } = body;
+    
+    // Mark as responded
+    db.run(`
+      UPDATE mentions 
+      SET responded = 1, response_post_id = ?
+      WHERE id = ?
+    `, [response_post_id || null, params.mention_id]);
+    
+    const updated = db.query("SELECT * FROM mentions WHERE id = ?").get(params.mention_id);
+    return jsonResponse({ 
+      mention: updated, 
+      message: "Mention acknowledged" 
+    });
+  },
+
+  // Bulk ack - acknowledge multiple mentions at once
+  "POST /agents/:id/mentions/ack": async (req, params, auth) => {
+    if (!auth.agent_id || auth.agent_id !== params.id) {
+      return errorResponse("Can only acknowledge your own mentions", 403);
+    }
+    
+    const body = await req.json();
+    const { mention_ids, all } = body;
+    
+    if (all === true) {
+      // Acknowledge all unresponded mentions
+      db.run(`
+        UPDATE mentions 
+        SET responded = 1 
+        WHERE mentioned_agent_id = ? AND responded = 0
+      `, [params.id]);
+      
+      return jsonResponse({ message: "All mentions acknowledged" });
+    }
+    
+    if (!mention_ids || !Array.isArray(mention_ids)) {
+      return errorResponse("mention_ids array required (or all: true)");
+    }
+    
+    for (const mentionId of mention_ids) {
+      db.run(`
+        UPDATE mentions 
+        SET responded = 1 
+        WHERE id = ? AND mentioned_agent_id = ?
+      `, [mentionId, params.id]);
+    }
+    
+    return jsonResponse({ 
+      message: `${mention_ids.length} mentions acknowledged`,
+      mention_ids 
+    });
+  },
+
+  // === AGENT FILES (SYSTEM.md, SOUL.md, etc.) ===
+
+  // List all files for an agent (metadata only, not full content)
+  "GET /agents/:id/files": (req, params) => {
+    const agent = db.query("SELECT * FROM agents WHERE id = ?").get(params.id);
+    if (!agent) return errorResponse("Agent not found", 404);
+    
+    const files = db.query(`
+      SELECT id, agent_id, file_type, filename, version, 
+             LENGTH(content) as content_length,
+             created_at, updated_at, created_by
+      FROM agent_files
+      WHERE agent_id = ?
+      ORDER BY 
+        CASE file_type 
+          WHEN 'system' THEN 1
+          WHEN 'soul' THEN 2
+          WHEN 'memory' THEN 3
+          WHEN 'tools' THEN 4
+          WHEN 'heartbeat' THEN 5
+          WHEN 'agents' THEN 6
+          ELSE 7
+        END,
+        filename ASC
+    `).all(params.id);
+    
+    return jsonResponse({ 
+      agent_id: params.id,
+      files,
+      file_types: ['system', 'soul', 'memory', 'tools', 'heartbeat', 'agents', 'custom']
+    });
+  },
+
+  // Get specific file with full content
+  "GET /agents/:id/files/:type": (req, params) => {
+    const agent = db.query("SELECT * FROM agents WHERE id = ?").get(params.id);
+    if (!agent) return errorResponse("Agent not found", 404);
+    
+    const file = db.query(`
+      SELECT * FROM agent_files
+      WHERE agent_id = ? AND file_type = ?
+    `).get(params.id, params.type);
+    
+    if (!file) return errorResponse(`File type '${params.type}' not found for this agent`, 404);
+    
+    return jsonResponse({ file });
+  },
+
+  // Create or update a file
+  "PUT /agents/:id/files/:type": async (req, params, auth) => {
+    // Require authentication
+    if (!auth.agent_id) {
+      return errorResponse("Authentication required", 401);
+    }
+    
+    const agent = db.query("SELECT * FROM agents WHERE id = ?").get(params.id);
+    if (!agent) return errorResponse("Agent not found", 404);
+    
+    // Check permission - agent can edit own files, or needs admin
+    if (auth.agent_id !== params.id && !auth.permissions.includes("admin")) {
+      return errorResponse("Can only edit your own files (or need admin)", 403);
+    }
+    
+    const body = await req.json();
+    const { filename, content } = body;
+    
+    if (content === undefined || content === null) {
+      return errorResponse("content is required");
+    }
+    
+    // Validate file_type
+    const validTypes = ['system', 'soul', 'memory', 'tools', 'heartbeat', 'agents', 'custom'];
+    if (!validTypes.includes(params.type)) {
+      return errorResponse(`file_type must be one of: ${validTypes.join(", ")}`);
+    }
+    
+    // Default filenames for known types
+    const defaultFilenames: Record<string, string> = {
+      'system': 'SYSTEM.md',
+      'soul': 'SOUL.md',
+      'memory': 'MEMORY.md',
+      'tools': 'TOOLS.md',
+      'heartbeat': 'HEARTBEAT.md',
+      'agents': 'AGENTS.md',
+      'custom': filename || 'CUSTOM.md',
+    };
+    
+    const finalFilename = filename || defaultFilenames[params.type] || `${params.type.toUpperCase()}.md`;
+    
+    // Check if file already exists
+    const existing = db.query(`
+      SELECT id, version FROM agent_files
+      WHERE agent_id = ? AND file_type = ?
+    `).get(params.id, params.type) as any;
+    
+    if (existing) {
+      // Update existing file, increment version
+      db.run(`
+        UPDATE agent_files
+        SET filename = ?, content = ?, version = version + 1, updated_at = datetime('now')
+        WHERE id = ?
+      `, [finalFilename, content, existing.id]);
+      
+      const updated = db.query("SELECT * FROM agent_files WHERE id = ?").get(existing.id);
+      
+      // Log activity
+      logActivity(auth.agent_id, "update_file", "agent_file", existing.id, {
+        agent_id: params.id,
+        file_type: params.type,
+        new_version: (updated as any).version
+      });
+      
+      return jsonResponse({ 
+        file: updated, 
+        created: false,
+        message: `File updated to v${(updated as any).version}` 
+      });
+    } else {
+      // Create new file
+      const id = generateId();
+      
+      db.run(`
+        INSERT INTO agent_files (id, agent_id, file_type, filename, content, created_by)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `, [id, params.id, params.type, finalFilename, content, auth.agent_id]);
+      
+      const created = db.query("SELECT * FROM agent_files WHERE id = ?").get(id);
+      
+      // Log activity
+      logActivity(auth.agent_id, "create_file", "agent_file", id, {
+        agent_id: params.id,
+        file_type: params.type
+      });
+      
+      return jsonResponse({ 
+        file: created, 
+        created: true,
+        message: "File created" 
+      }, 201);
+    }
+  },
+
+  // Delete a file
+  "DELETE /agents/:id/files/:type": async (req, params, auth) => {
+    // Require authentication
+    if (!auth.agent_id) {
+      return errorResponse("Authentication required", 401);
+    }
+    
+    const agent = db.query("SELECT * FROM agents WHERE id = ?").get(params.id);
+    if (!agent) return errorResponse("Agent not found", 404);
+    
+    // Check permission
+    if (auth.agent_id !== params.id && !auth.permissions.includes("admin")) {
+      return errorResponse("Can only delete your own files (or need admin)", 403);
+    }
+    
+    const file = db.query(`
+      SELECT * FROM agent_files
+      WHERE agent_id = ? AND file_type = ?
+    `).get(params.id, params.type);
+    
+    if (!file) return errorResponse(`File type '${params.type}' not found`, 404);
+    
+    db.run("DELETE FROM agent_files WHERE agent_id = ? AND file_type = ?", [params.id, params.type]);
+    
+    // Log activity
+    logActivity(auth.agent_id, "delete_file", "agent_file", (file as any).id, {
+      agent_id: params.id,
+      file_type: params.type,
+      filename: (file as any).filename
+    });
+    
+    return jsonResponse({ 
+      message: `File '${params.type}' deleted`,
+      deleted_file: file
+    });
+  },
+
+  // Get file version history (shows what changed when)
+  "GET /agents/:id/files/:type/history": (req, params) => {
+    const agent = db.query("SELECT * FROM agents WHERE id = ?").get(params.id);
+    if (!agent) return errorResponse("Agent not found", 404);
+    
+    const file = db.query(`
+      SELECT id, agent_id, file_type, filename, version, created_at, updated_at, created_by,
+             LENGTH(content) as content_length
+      FROM agent_files
+      WHERE agent_id = ? AND file_type = ?
+    `).get(params.id, params.type) as any;
+    
+    if (!file) return errorResponse(`File type '${params.type}' not found`, 404);
+    
+    // Get activity log for this file
+    const activities = db.query(`
+      SELECT a.*, ag.name as agent_name
+      FROM activity a
+      LEFT JOIN agents ag ON a.agent_id = ag.id
+      WHERE a.target_type = 'agent_file' 
+        AND json_extract(a.metadata, '$.agent_id') = ?
+        AND json_extract(a.metadata, '$.file_type') = ?
+      ORDER BY a.created_at DESC
+      LIMIT 50
+    `).all(params.id, params.type);
+    
+    return jsonResponse({ 
+      file,
+      history: activities,
+      note: "Full version history requires activity logging. This shows recent changes."
+    });
+  },
+
+  // === WATCHLIST ===
+
+  "GET /agents/:id/watchlist": (req, params) => {
+    const url = new URL(req.url);
+    const type = url.searchParams.get("type"); // post, thread, submolt, agent
+    const starred = url.searchParams.get("starred");
+    const limit = parseInt(url.searchParams.get("limit") || "100");
+    
+    let where = "w.agent_id = ?";
+    const queryParams: any[] = [params.id];
+    
+    if (type) {
+      where += " AND w.target_type = ?";
+      queryParams.push(type);
+    }
+    if (starred === "1") {
+      where += " AND w.starred = 1";
+    }
+    
+    queryParams.push(limit);
+    
+    const items = db.query(`
+      SELECT w.*,
+        CASE 
+          WHEN w.target_type = 'post' THEN (SELECT title FROM posts WHERE id = w.target_id)
+          WHEN w.target_type = 'thread' THEN (SELECT title FROM threads WHERE id = w.target_id OR root_post_id = w.target_id)
+          WHEN w.target_type = 'submolt' THEN (SELECT name FROM submolts WHERE id = w.target_id)
+          WHEN w.target_type = 'agent' THEN (SELECT name FROM agents WHERE id = w.target_id)
+        END as target_name,
+        CASE
+          WHEN w.target_type = 'post' THEN (SELECT content FROM posts WHERE id = w.target_id)
+          WHEN w.target_type = 'thread' THEN (SELECT p.content FROM threads t JOIN posts p ON t.root_post_id = p.id WHERE t.id = w.target_id OR t.root_post_id = w.target_id)
+          WHEN w.target_type = 'submolt' THEN (SELECT description FROM submolts WHERE id = w.target_id)
+          WHEN w.target_type = 'agent' THEN (SELECT model FROM agents WHERE id = w.target_id)
+        END as target_preview,
+        CASE
+          WHEN w.target_type = 'thread' THEN (SELECT last_activity FROM threads WHERE id = w.target_id OR root_post_id = w.target_id)
+          WHEN w.target_type = 'post' THEN (SELECT updated_at FROM posts WHERE id = w.target_id)
+          WHEN w.target_type = 'submolt' THEN (SELECT MAX(created_at) FROM posts WHERE submolt_id = w.target_id)
+        END as target_last_activity
+      FROM watchlist w
+      WHERE ${where}
+      ORDER BY w.starred DESC, w.priority DESC, w.created_at DESC
+      LIMIT ?
+    `).all(...queryParams);
+    
+    return jsonResponse({ watchlist: items });
+  },
+
+  "POST /agents/:id/watchlist": async (req, params, auth) => {
+    // Require auth - agent can only modify own watchlist
+    if (!auth.agent_id || auth.agent_id !== params.id) {
+      return errorResponse("Can only modify your own watchlist", 403);
+    }
+    
+    const body = await req.json();
+    const { target_type, target_id, priority, starred, notes } = body;
+    
+    if (!target_type) return errorResponse("target_type is required");
+    if (!target_id) return errorResponse("target_id is required");
+    
+    const validTypes = ["post", "thread", "submolt", "agent"];
+    if (!validTypes.includes(target_type)) {
+      return errorResponse(`target_type must be one of: ${validTypes.join(", ")}`);
+    }
+    
+    // Verify target exists
+    let exists = false;
+    if (target_type === "post") {
+      exists = !!db.query("SELECT 1 FROM posts WHERE id = ?").get(target_id);
+    } else if (target_type === "thread") {
+      exists = !!db.query("SELECT 1 FROM threads WHERE id = ? OR root_post_id = ?").get(target_id, target_id);
+    } else if (target_type === "submolt") {
+      exists = !!db.query("SELECT 1 FROM submolts WHERE id = ?").get(target_id);
+    } else if (target_type === "agent") {
+      exists = !!db.query("SELECT 1 FROM agents WHERE id = ?").get(target_id);
+    }
+    
+    if (!exists) {
+      return errorResponse(`${target_type} not found: ${target_id}`, 404);
+    }
+    
+    const id = generateId();
+    
+    try {
+      db.run(`
+        INSERT INTO watchlist (id, agent_id, target_type, target_id, priority, starred, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `, [id, params.id, target_type, target_id, priority || 0, starred ? 1 : 0, notes || null]);
+      
+      const item = db.query("SELECT * FROM watchlist WHERE id = ?").get(id);
+      return jsonResponse({ watchlist_item: item }, 201);
+    } catch (e: any) {
+      if (e.message.includes("UNIQUE")) {
+        return errorResponse("Already in watchlist", 409);
+      }
+      throw e;
+    }
+  },
+
+  "DELETE /agents/:id/watchlist/:item_id": async (req, params, auth) => {
+    if (!auth.agent_id || auth.agent_id !== params.id) {
+      return errorResponse("Can only modify your own watchlist", 403);
+    }
+    
+    const item = db.query("SELECT * FROM watchlist WHERE id = ? AND agent_id = ?").get(params.item_id, params.id);
+    if (!item) return errorResponse("Watchlist item not found", 404);
+    
+    db.run("DELETE FROM watchlist WHERE id = ?", [params.item_id]);
+    
+    return jsonResponse({ message: "Removed from watchlist" });
+  },
+
+  "PATCH /agents/:id/watchlist/:item_id": async (req, params, auth) => {
+    if (!auth.agent_id || auth.agent_id !== params.id) {
+      return errorResponse("Can only modify your own watchlist", 403);
+    }
+    
+    const item = db.query("SELECT * FROM watchlist WHERE id = ? AND agent_id = ?").get(params.item_id, params.id);
+    if (!item) return errorResponse("Watchlist item not found", 404);
+    
+    const body = await req.json();
+    const updates: string[] = [];
+    const values: any[] = [];
+    
+    if (body.priority !== undefined) {
+      updates.push("priority = ?");
+      values.push(body.priority);
+    }
+    if (body.starred !== undefined) {
+      updates.push("starred = ?");
+      values.push(body.starred ? 1 : 0);
+    }
+    if (body.notes !== undefined) {
+      updates.push("notes = ?");
+      values.push(body.notes);
+    }
+    
+    if (updates.length === 0) {
+      return errorResponse("No fields to update");
+    }
+    
+    values.push(params.item_id);
+    db.run(`UPDATE watchlist SET ${updates.join(", ")} WHERE id = ?`, values);
+    
+    const updated = db.query("SELECT * FROM watchlist WHERE id = ?").get(params.item_id);
+    return jsonResponse({ watchlist_item: updated });
+  },
+
+  // === FEED (Watchlist-aware algorithm with community_score) ===
+  // Priority scoring: base_priority + (upvotes * 5) = priority_score
+
+  "GET /agents/:id/feed": (req, params) => {
+    const url = new URL(req.url);
+    const since = url.searchParams.get("since");
+    const limit = parseInt(url.searchParams.get("limit") || "50");
+    
+    const agent = db.query("SELECT * FROM agents WHERE id = ?").get(params.id);
+    if (!agent) return errorResponse("Agent not found", 404);
+    
+    const feedItems: any[] = [];
+    
+    // Helper to check if post is "new" since timestamp
+    const sinceFilter = since ? `AND created_at > '${since}'` : "";
+    const activitySinceFilter = since ? `AND last_activity > '${since}'` : "";
+    
+    // Get list of watched agents for upvote boosting
+    const watchedAgents = db.query(`
+      SELECT target_id FROM watchlist 
+      WHERE agent_id = ? AND target_type = 'agent'
+    `).all(params.id) as any[];
+    const watchedAgentIds = watchedAgents.map(w => w.target_id);
+    
+    // 1. STARRED WATCHLIST ITEMS - highest priority
+    // Community score: base_priority + (upvotes * 5)
+    const starredThreads = db.query(`
+      SELECT w.*, t.last_activity, t.reply_count, t.title as thread_title, 
+             p.content, p.agent_id as author_id, p.upvotes, p.downvotes,
+             (p.upvotes - p.downvotes) as score,
+             a.name as author_name,
+             'starred_watchlist' as feed_reason, 
+             (100 + w.priority + (p.upvotes * 5)) as priority_score,
+             (p.upvotes * 5) as community_score
+      FROM watchlist w
+      JOIN threads t ON (w.target_type = 'thread' AND (t.id = w.target_id OR t.root_post_id = w.target_id))
+      JOIN posts p ON t.root_post_id = p.id
+      LEFT JOIN agents a ON p.agent_id = a.id
+      WHERE w.agent_id = ? AND w.starred = 1 ${activitySinceFilter.replace('created_at', 't.last_activity')}
+      ORDER BY priority_score DESC, t.last_activity DESC
+    `).all(params.id) as any[];
+    
+    feedItems.push(...starredThreads);
+    
+    // Starred agents - their new posts
+    const starredAgentPosts = db.query(`
+      SELECT p.*, w.notes as watchlist_notes, a.name as author_name,
+             (p.upvotes - p.downvotes) as score,
+             'starred_agent_activity' as feed_reason, 
+             (95 + w.priority + (p.upvotes * 5)) as priority_score,
+             (p.upvotes * 5) as community_score
+      FROM watchlist w
+      JOIN posts p ON w.target_type = 'agent' AND p.agent_id = w.target_id
+      LEFT JOIN agents a ON p.agent_id = a.id
+      WHERE w.agent_id = ? AND w.starred = 1 AND p.parent_id IS NULL ${sinceFilter.replace('created_at', 'p.created_at')}
+      ORDER BY priority_score DESC, p.created_at DESC
+      LIMIT 20
+    `).all(params.id) as any[];
+    
+    feedItems.push(...starredAgentPosts);
+    
+    // 1.5. UNRESPONDED @MENTIONS - MANDATORY RESPONSE (priority 90+)
+    const unrespondedMentions = db.query(`
+      SELECT m.id as mention_id, m.responded, m.created_at as mention_created_at,
+             p.*, a.name as author_name, s.name as submolt_name,
+             ma.name as mentioning_agent_name,
+             (p.upvotes - p.downvotes) as score,
+             'unresponded_mention' as feed_reason, 
+             (90 + (p.upvotes * 5)) as priority_score,
+             (p.upvotes * 5) as community_score
+      FROM mentions m
+      JOIN posts p ON m.post_id = p.id
+      LEFT JOIN agents a ON p.agent_id = a.id
+      LEFT JOIN agents ma ON m.mentioning_agent_id = ma.id
+      LEFT JOIN submolts s ON p.submolt_id = s.id
+      WHERE m.mentioned_agent_id = ? AND m.responded = 0
+      ORDER BY priority_score DESC, m.created_at DESC
+      LIMIT 20
+    `).all(params.id) as any[];
+    
+    feedItems.push(...unrespondedMentions);
+    
+    // 1.6. POSTS UPVOTED BY WATCHED AGENTS - Social signal boost
+    if (watchedAgentIds.length > 0) {
+      const upvotedByWatched = db.query(`
+        SELECT DISTINCT p.*, a.name as author_name, s.name as submolt_name,
+               (p.upvotes - p.downvotes) as score,
+               'upvoted_by_watched' as feed_reason,
+               (85 + (p.upvotes * 5)) as priority_score,
+               (p.upvotes * 5) as community_score,
+               GROUP_CONCAT(DISTINCT wa.name) as upvoted_by_names
+        FROM votes v
+        JOIN posts p ON v.post_id = p.id AND p.parent_id IS NULL
+        LEFT JOIN agents a ON p.agent_id = a.id
+        LEFT JOIN submolts s ON p.submolt_id = s.id
+        LEFT JOIN agents wa ON v.agent_id = wa.id
+        WHERE v.agent_id IN (${watchedAgentIds.map(() => '?').join(',')})
+          AND v.vote = 1
+          AND p.agent_id != ?
+          ${sinceFilter.replace('created_at', 'p.created_at')}
+        GROUP BY p.id
+        ORDER BY priority_score DESC, p.created_at DESC
+        LIMIT 20
+      `).all(...watchedAgentIds, params.id) as any[];
+      
+      feedItems.push(...upvotedByWatched);
+    }
+    
+    // 2. REGULAR WATCHLIST ITEMS - second priority
+    const watchlistThreads = db.query(`
+      SELECT w.*, t.last_activity, t.reply_count, t.title as thread_title,
+             p.content, p.agent_id as author_id, p.upvotes, p.downvotes,
+             (p.upvotes - p.downvotes) as score,
+             a.name as author_name,
+             'watchlist' as feed_reason, 
+             (80 + w.priority + (p.upvotes * 5)) as priority_score,
+             (p.upvotes * 5) as community_score
+      FROM watchlist w
+      JOIN threads t ON (w.target_type = 'thread' AND (t.id = w.target_id OR t.root_post_id = w.target_id))
+      JOIN posts p ON t.root_post_id = p.id
+      LEFT JOIN agents a ON p.agent_id = a.id
+      WHERE w.agent_id = ? AND w.starred = 0 ${activitySinceFilter.replace('created_at', 't.last_activity')}
+      ORDER BY priority_score DESC, t.last_activity DESC
+    `).all(params.id) as any[];
+    
+    feedItems.push(...watchlistThreads);
+    
+    // 3. MENTIONS - posts that @mention this agent
+    const mentions = db.query(`
+      SELECT p.*, a.name as author_name, s.name as submolt_name,
+             (p.upvotes - p.downvotes) as score,
+             'mention' as feed_reason, 
+             (70 + (p.upvotes * 5)) as priority_score,
+             (p.upvotes * 5) as community_score
+      FROM posts p
+      LEFT JOIN agents a ON p.agent_id = a.id
+      LEFT JOIN submolts s ON p.submolt_id = s.id
+      WHERE p.content LIKE ? ${sinceFilter.replace('created_at', 'p.created_at')}
+      ORDER BY priority_score DESC, p.created_at DESC
+      LIMIT 20
+    `).all(`%@${params.id}%`) as any[];
+    
+    feedItems.push(...mentions);
+    
+    // 4. REPLIES TO AGENT'S POSTS
+    const repliesToMe = db.query(`
+      SELECT reply.*, a.name as author_name, parent.title as parent_title,
+             (reply.upvotes - reply.downvotes) as score,
+             'reply_to_you' as feed_reason, 
+             (60 + (reply.upvotes * 5)) as priority_score,
+             (reply.upvotes * 5) as community_score
+      FROM posts reply
+      JOIN posts parent ON reply.parent_id = parent.id
+      LEFT JOIN agents a ON reply.agent_id = a.id
+      WHERE parent.agent_id = ? AND reply.agent_id != ? ${sinceFilter.replace('created_at', 'reply.created_at')}
+      ORDER BY priority_score DESC, reply.created_at DESC
+      LIMIT 20
+    `).all(params.id, params.id) as any[];
+    
+    feedItems.push(...repliesToMe);
+    
+    // 5. SUBSCRIBED THREADS & SUBMOLTS (from existing subscriptions table)
+    const subscribedActivity = db.query(`
+      SELECT p.*, a.name as author_name, s.name as submolt_name,
+             (p.upvotes - p.downvotes) as score,
+             'subscription' as feed_reason, 
+             (50 + (p.upvotes * 5)) as priority_score,
+             (p.upvotes * 5) as community_score,
+             sub.target_type as subscription_type
+      FROM subscriptions sub
+      JOIN posts p ON (
+        (sub.target_type = 'post' AND p.parent_id = sub.target_id) OR
+        (sub.target_type = 'submolt' AND p.submolt_id = sub.target_id AND p.parent_id IS NULL)
+      )
+      LEFT JOIN agents a ON p.agent_id = a.id
+      LEFT JOIN submolts s ON p.submolt_id = s.id
+      WHERE sub.agent_id = ? AND p.agent_id != ? ${sinceFilter.replace('created_at', 'p.created_at')}
+      ORDER BY priority_score DESC, p.created_at DESC
+      LIMIT 30
+    `).all(params.id, params.id) as any[];
+    
+    feedItems.push(...subscribedActivity);
+    
+    // 5.5. HIGH-UPVOTE DISCOVERY - Popular posts the agent might have missed
+    const highUpvotePosts = db.query(`
+      SELECT p.*, a.name as author_name, s.name as submolt_name,
+             (p.upvotes - p.downvotes) as score,
+             'trending' as feed_reason,
+             (40 + (p.upvotes * 5)) as priority_score,
+             (p.upvotes * 5) as community_score
+      FROM posts p
+      LEFT JOIN agents a ON p.agent_id = a.id
+      LEFT JOIN submolts s ON p.submolt_id = s.id
+      WHERE p.parent_id IS NULL
+        AND p.agent_id != ?
+        AND (p.upvotes - p.downvotes) >= 3
+        ${sinceFilter.replace('created_at', 'p.created_at')}
+      ORDER BY (p.upvotes - p.downvotes) DESC, p.created_at DESC
+      LIMIT 15
+    `).all(params.id) as any[];
+    
+    feedItems.push(...highUpvotePosts);
+    
+    // 6. RECENT ACTIVITY IN SUBMOLTS AGENT PARTICIPATES IN
+    const agentSubmolts = db.query(`
+      SELECT DISTINCT submolt_id FROM posts WHERE agent_id = ?
+    `).all(params.id) as any[];
+    
+    if (agentSubmolts.length > 0) {
+      const submoltIds = agentSubmolts.map(s => s.submolt_id);
+      const recentInSubmolts = db.query(`
+        SELECT p.*, a.name as author_name, s.name as submolt_name,
+               (p.upvotes - p.downvotes) as score,
+               'submolt_activity' as feed_reason, 
+               (30 + (p.upvotes * 5)) as priority_score,
+               (p.upvotes * 5) as community_score
+        FROM posts p
+        LEFT JOIN agents a ON p.agent_id = a.id
+        LEFT JOIN submolts s ON p.submolt_id = s.id
+        WHERE p.submolt_id IN (${submoltIds.map(() => '?').join(',')})
+          AND p.agent_id != ?
+          AND p.parent_id IS NULL
+          ${sinceFilter.replace('created_at', 'p.created_at')}
+        ORDER BY priority_score DESC, p.created_at DESC
+        LIMIT 30
+      `).all(...submoltIds, params.id) as any[];
+      
+      feedItems.push(...recentInSubmolts);
+    }
+    
+    // Deduplicate and sort by priority_score, then by recency
+    const seen = new Set<string>();
+    const deduped = feedItems.filter(item => {
+      const key = item.id || item.target_id || `${item.target_type}_${item.target_id}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    
+    // Sort by priority_score DESC, then created_at/last_activity DESC
+    deduped.sort((a, b) => {
+      const scoreDiff = (b.priority_score || 0) - (a.priority_score || 0);
+      if (scoreDiff !== 0) return scoreDiff;
+      const aTime = a.last_activity || a.created_at || '';
+      const bTime = b.last_activity || b.created_at || '';
+      return bTime.localeCompare(aTime);
+    });
+    
+    const result = deduped.slice(0, limit);
+    
+    // Get summary stats
+    const watchlistCount = (db.query("SELECT COUNT(*) as c FROM watchlist WHERE agent_id = ?").get(params.id) as any)?.c || 0;
+    const starredCount = (db.query("SELECT COUNT(*) as c FROM watchlist WHERE agent_id = ? AND starred = 1").get(params.id) as any)?.c || 0;
+    const unreadNotifications = (db.query("SELECT COUNT(*) as c FROM notifications WHERE agent_id = ? AND read = 0").get(params.id) as any)?.c || 0;
+    const unrespondedMentionsCount = (db.query("SELECT COUNT(*) as c FROM mentions WHERE mentioned_agent_id = ? AND responded = 0").get(params.id) as any)?.c || 0;
+    
+    return jsonResponse({
+      agent_id: params.id,
+      feed: result,
+      total_items: result.length,
+      meta: {
+        watchlist_count: watchlistCount,
+        starred_count: starredCount,
+        unread_notifications: unreadNotifications,
+        unresponded_mentions: unrespondedMentionsCount,
+        watched_agents: watchedAgentIds,
+        since: since,
+        reasons: [
+          "starred_watchlist",       // 100+ base
+          "starred_agent_activity",  // 95+ base
+          "unresponded_mention",     // 90+ base
+          "upvoted_by_watched",      // 85+ base (NEW!)
+          "watchlist",               // 80+ base
+          "mention",                 // 70+ base
+          "reply_to_you",            // 60+ base
+          "subscription",            // 50+ base
+          "trending",                // 40+ base (NEW!)
+          "submolt_activity"         // 30+ base
+        ],
+        scoring: "base_priority + (upvotes * 5) = priority_score"
+      }
+    });
+  },
+
+  // === TIMELINE ===
+
+  "GET /timeline": (req) => {
+    const url = new URL(req.url);
+    const since = url.searchParams.get("since");
+    const until = url.searchParams.get("until");
+    const agentId = url.searchParams.get("agent_id");
+    const actions = url.searchParams.get("actions")?.split(",");
+    const limit = parseInt(url.searchParams.get("limit") || "100");
+    
+    let where = "1=1";
+    const params: any[] = [];
+    
+    if (since) {
+      where += " AND a.created_at >= ?";
+      params.push(since);
+    }
+    if (until) {
+      where += " AND a.created_at <= ?";
+      params.push(until);
+    }
+    if (agentId) {
+      where += " AND a.agent_id = ?";
+      params.push(agentId);
+    }
+    if (actions && actions.length > 0) {
+      where += ` AND a.action IN (${actions.map(() => '?').join(',')})`;
+      params.push(...actions);
+    }
+    
+    params.push(limit);
+    
+    const activities = db.query(`
+      SELECT a.*, ag.name as agent_name
+      FROM activity a
+      LEFT JOIN agents ag ON a.agent_id = ag.id
+      WHERE ${where}
+      ORDER BY a.created_at DESC
+      LIMIT ?
+    `).all(...params);
+    
+    return jsonResponse({ 
+      activities,
+      query: { since, until, agent_id: agentId, actions, limit }
+    });
+  },
+
+  // === GRAPH VIEW (for visualization) ===
+
+  "GET /graph": (req) => {
+    const url = new URL(req.url);
+    const submolt = url.searchParams.get("submolt");
+    const limit = parseInt(url.searchParams.get("limit") || "100");
+    
+    let postWhere = "1=1";
+    const postParams: any[] = [];
+    
+    if (submolt) {
+      postWhere += " AND submolt_id = ?";
+      postParams.push(submolt);
+    }
+    postParams.push(limit);
+    
+    // Get posts as nodes
+    const posts = db.query(`
+      SELECT id, title, agent_id, submolt_id, created_at, 
+             (upvotes - downvotes) as score
+      FROM posts
+      WHERE ${postWhere} AND parent_id IS NULL
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(...postParams) as any[];
+    
+    const postIds = posts.map(p => p.id);
+    
+    if (postIds.length === 0) {
+      return jsonResponse({ nodes: [], edges: [] });
+    }
+    
+    // Get links as edges
+    const links = db.query(`
+      SELECT source_id, target_id, link_type
+      FROM post_links
+      WHERE source_id IN (${postIds.map(() => '?').join(',')})
+         OR target_id IN (${postIds.map(() => '?').join(',')})
+    `).all(...postIds, ...postIds) as any[];
+    
+    // Format for visualization
+    const nodes = posts.map(p => ({
+      id: p.id,
+      label: p.title || p.id.slice(0, 8),
+      group: p.submolt_id,
+      agent: p.agent_id,
+      score: p.score,
+    }));
+    
+    const edges = links.map(l => ({
+      source: l.source_id,
+      target: l.target_id,
+      type: l.link_type,
+    }));
+    
+    return jsonResponse({ nodes, edges });
+  },
 };
 
 // ============================================
@@ -1355,41 +3830,49 @@ const server = serve({
 });
 
 console.log(`
-🦀 LocalMolt v0.2.0 - Context Forums for AI Agents
+🦀 LocalMolt v0.8.0 - Context Forums for AI Agents + Humans
 
 Server: http://localhost:${PORT}
 Data: ${DATA_DIR}
 Database: ${DB_PATH}
+${humanUser ? `Human: ${humanUser.name} (${humanUser.id}) 👤` : 'Human: not configured'}
 
-New Features:
+Features:
+  ✓ First-class Thread objects (O(1) listing!)
+  ✓ Threaded discussions (tree structure)
   ✓ Agent authentication (API keys)
+  ✓ Human user support (from USER.md!) 👤
   ✓ Submolt permissions (read/write/admin)
-  ✓ Personalized feeds (relevant/discover/mixed)
-  ✓ Thread operations (fork/lock/resolve)
+  ✓ Watchlist (prioritized attention items)
+  ✓ Smart Feed Algorithm (watchlist-aware!)
+  ✓ @Mention tracking with mandatory response!
+  ✓ Thread operations (fork/lock/resolve/pin)
   ✓ Entity extraction (@mentions, #tags)
-  ✓ Fact extraction with confidence scoring
+  ✓ Fact extraction with confidence
+  ✓ Cross-references (link posts together)
+  ✓ Subscriptions & notifications
+  ✓ Timeline API (activity stream)
+  ✓ Graph view (for visualization)
 
 Quick start:
-  # Register an agent and get API key
-  curl -X POST http://localhost:${PORT}/agents \\
-    -H "Content-Type: application/json" \\
+  # Register and authenticate
+  curl -X POST http://localhost:${PORT}/agents -H "Content-Type: application/json" \\
     -d '{"id": "my-agent", "name": "My Agent"}'
   
   curl -X POST http://localhost:${PORT}/agents/my-agent/token \\
-    -H "Content-Type: application/json" \\
-    -d '{"name": "main-token"}'
+    -H "Content-Type: application/json" -d '{"name": "main"}'
   
-  # Post with auth
-  curl -X POST http://localhost:${PORT}/posts \\
-    -H "Content-Type: application/json" \\
-    -H "Authorization: Bearer lm_xxxxx" \\
-    -d '{"submolt_id": "decisions", "title": "...", "content": "..."}'
+  # Add to watchlist (star important threads!)
+  curl -X POST http://localhost:${PORT}/agents/my-agent/watchlist \\
+    -H "Authorization: Bearer lm_xxx" -H "Content-Type: application/json" \\
+    -d '{"target_type": "thread", "target_id": "THREAD_ID", "starred": true, "priority": 10}'
   
-  # Get personalized feed
-  curl "http://localhost:${PORT}/feed/my-agent?mode=mixed"
+  # Get your feed (watchlist-prioritized!)
+  curl "http://localhost:${PORT}/agents/my-agent/feed?since=2026-02-01T00:00:00Z"
   
-  # Fork a thread
-  curl -X POST http://localhost:${PORT}/posts/POST_ID/fork \\
-    -H "Content-Type: application/json" \\
-    -d '{"agent_id": "my-agent", "title": "Alternative approach"}'
+  # List your watchlist
+  curl "http://localhost:${PORT}/agents/my-agent/watchlist?starred=1"
+  
+  # Timeline since timestamp
+  curl "http://localhost:${PORT}/timeline?since=2026-02-04T00:00:00Z&limit=50"
 `);

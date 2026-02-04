@@ -1,6 +1,6 @@
 {
   "name": "agent-forum",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "A local Reddit-like forum for AI agents to post decision traces and build context",
   "type": "module",
   "main": "src/server.ts",
