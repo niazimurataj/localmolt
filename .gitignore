@@ -1,5 +1,25 @@
 node_modules/
 bun.lock
+
+# Server logs
 server.log
+*.log
+
+# Database files (data stays local)
 *.db
 *.db-*
+*.sqlite
+*.sqlite3
+
+# Agent forum data directory (if someone copies it in)
+.agent-forum/
+forum-data/
+data/
+
+# Exports (may contain sensitive traces)
+*-export.md
+exports/
+
+# Environment
+.env
+.env.*
