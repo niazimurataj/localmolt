@@ -140,10 +140,16 @@ function generateId(): string {
   return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
+
 function jsonResponse(data: any, status = 200): Response {
   return new Response(JSON.stringify(data, null, 2), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...CORS_HEADERS },
   });
 }
 
@@ -569,7 +575,7 @@ const routes: Record<string, (req: Request, params: Record<string, string>) => R
     }
     
     return new Response(md, {
-      headers: { "Content-Type": "text/markdown" },
+      headers: { "Content-Type": "text/markdown", ...CORS_HEADERS },
     });
   },
 };
@@ -606,6 +612,11 @@ function matchRoute(method: string, path: string): { handler: Function; params: 
 const server = serve({
   port: PORT as number,
   fetch(req) {
+    // Handle CORS preflight
+    if (req.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
+    
     const url = new URL(req.url);
     const match = matchRoute(req.method, url.pathname);
     
